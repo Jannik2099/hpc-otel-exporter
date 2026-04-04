@@ -1,0 +1,19 @@
+otelcol.receiver.otlp "ingest" {
+	grpc {
+		endpoint = "0.0.0.0:4317"
+	}
+
+	http {
+		endpoint = "0.0.0.0:4318"
+	}
+
+	output {
+		metrics = [otelcol.exporter.otlphttp.mimir.input]
+	}
+}
+
+otelcol.exporter.otlphttp "mimir" {
+	client {
+		endpoint = "http://mimir:9009/otlp"
+	}
+}

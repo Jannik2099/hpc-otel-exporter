@@ -1,0 +1,34 @@
+services:
+  mimir:
+    image: docker.io/grafana/mimir:latest
+    command:
+      - -config.file=/etc/mimir/mimir.yaml
+    volumes:
+      - ./docker/mimir/mimir.yaml:/etc/mimir/mimir.yaml:ro
+
+  grafana:
+    image: docker.io/grafana/grafana:latest
+    depends_on:
+      - mimir
+    ports:
+      - "3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_BASIC_ENABLED: "false"
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+
+  alloy:
+    image: docker.io/grafana/alloy:latest
+    depends_on:
+      - mimir
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --server.http.listen-addr=0.0.0.0:12345
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    volumes:
+      - ./docker/alloy/config.alloy:/etc/alloy/config.alloy:ro
