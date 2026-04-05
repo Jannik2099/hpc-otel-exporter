@@ -52,6 +52,10 @@ impl IoMetrics {
     /// Record an IO event. If this is the first event for the cgroup, a new
     /// [`SdkMeterProvider`] is created on the fly.
     pub fn record(&self, event: &bindings::IOEvent) {
+        if event.fs_magic.is_ephemeral_fs() {
+            return;
+        }
+
         let metrics = self
             .cgroups
             .entry(event.cgroup_id)
@@ -67,11 +71,14 @@ impl IoMetrics {
         } else {
             "write"
         };
-        let attrs = [
+        let mut attrs = vec![
             KeyValue::new("io.type", io_type),
-            KeyValue::new("cgroup.id", event.cgroup_id as i64),
             KeyValue::new("cgroup.name", metrics.name.clone()),
+            KeyValue::new("fs.magic", format!("{:#x}", event.fs_magic as u64)),
         ];
+        if let Some(fs_name) = event.fs_magic.magic_to_pretty_name() {
+            attrs.push(KeyValue::new("fs.type", fs_name));
+        }
 
         metrics.duration_histogram.record(duration_ns, &attrs);
         metrics.size_histogram.record(

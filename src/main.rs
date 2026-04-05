@@ -10,20 +10,12 @@ use log::{debug, info, warn};
 use tokio::io::unix::AsyncFd;
 use tokio::signal;
 
+mod bindings;
 mod telemetry;
 
 // Include the generated skeleton module
 mod example {
     include!(concat!(env!("OUT_DIR"), "/example.skel.rs"));
-}
-
-// Include the generated bindings from common_shared.h
-mod bindings {
-    #![allow(non_upper_case_globals)]
-    #![allow(non_camel_case_types)]
-    #![allow(non_snake_case)]
-    #![allow(dead_code)]
-    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 
 use example::*;

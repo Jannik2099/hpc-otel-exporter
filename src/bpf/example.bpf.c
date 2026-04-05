@@ -84,9 +84,8 @@ int BPF_PROG(bpf_fexit_test, const struct file *file, char *, const u64 count, l
     event->time_info.end_time = end_time;
     event->fs_magic = magic;
     event->inode = file->f_inode->i_ino;
-    event->num_bytes_requested = count;
-    event->num_bytes_transferred = ((u32)ret) & 0b01111111111111111111111111111111;
     event->cgroup_id = bpf_get_current_cgroup_id();
+    event->num_bytes_transferred = ((u32)ret) & 0b01111111111111111111111111111111;
     event->mount_id = file_to_mount_id(file);
     event->pid = pid_tgid & 0xFFFFFFFF;
     event->tgid = pid_tgid >> 32;

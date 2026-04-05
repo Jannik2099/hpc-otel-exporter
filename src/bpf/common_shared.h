@@ -106,11 +106,10 @@ struct IOEvent {
     struct TimeInfo time_info;
     enum FsMagic fs_magic;
     uint64_t inode;
-    uint32_t num_bytes_requested;
+    uint64_t cgroup_id;
     // MSB stores READ = 0, WRITE = 1
     // linux caps at 2 GiB, so we get a free bit
     uint32_t num_bytes_transferred;
-    uint64_t cgroup_id;
     int32_t mount_id;
     uint32_t pid;
     uint32_t tgid;
