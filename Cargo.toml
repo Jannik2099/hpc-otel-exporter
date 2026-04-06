@@ -16,7 +16,7 @@ opentelemetry = { version = "0.31.0", features = ["metrics"] }
 opentelemetry-otlp = { version = "0.31.0", default-features = false, features = [
     "metrics",
     "grpc-tonic",
-    "zstd-tonic",
+    "tls-roots",
 ] }
 opentelemetry_sdk = { version = "0.31.0", features = [
     "metrics",
@@ -24,11 +24,6 @@ opentelemetry_sdk = { version = "0.31.0", features = [
 ] }
 rustc-hash = "2"
 tokio = { version = "1.48", features = ["full"] }
-
-[patch.crates-io]
-opentelemetry = { git = "https://github.com/open-telemetry/opentelemetry-rust.git", branch = "main" }
-opentelemetry-otlp = { git = "https://github.com/open-telemetry/opentelemetry-rust.git", branch = "main" }
-opentelemetry_sdk = { git = "https://github.com/open-telemetry/opentelemetry-rust.git", branch = "main" }
 
 [build-dependencies]
 libbpf-cargo = "0.26.0"
