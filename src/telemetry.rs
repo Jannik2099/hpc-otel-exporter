@@ -30,6 +30,7 @@ struct CgroupMetrics {
 /// longer exported.
 pub struct IoMetrics {
     cgroups: DashMap<u64, CgroupMetrics, FxBuildHasher>,
+    attrs_cache: DashMap<(u64, bool, u64), Arc<[KeyValue]>, FxBuildHasher>,
     /// Hostname, resolved once at construction.
     host: Arc<str>,
 }
@@ -45,6 +46,7 @@ impl IoMetrics {
 
         Self {
             cgroups: DashMap::default(),
+            attrs_cache: DashMap::default(),
             host: Arc::from(hostname.to_string_lossy().into_owned()),
         }
     }
@@ -66,24 +68,34 @@ impl IoMetrics {
             .end_time
             .saturating_sub(event.time_info.start_time);
 
-        let io_type = if (event.num_bytes_transferred & 0b10000000000000000000000000000000) == 0 {
-            "read"
-        } else {
-            "write"
-        };
-        let mut attrs = vec![
-            KeyValue::new("io.type", io_type),
-            KeyValue::new("cgroup.name", metrics.name.clone()),
-            KeyValue::new("fs.magic", format!("{:#x}", event.fs_magic as u64)),
-        ];
-        if let Some(fs_name) = event.fs_magic.magic_to_pretty_name() {
-            attrs.push(KeyValue::new("fs.type", fs_name));
-        }
+        let io_type = (event.num_bytes_transferred & 0b10000000000000000000000000000000) != 0;
+        let io_type_name = if io_type { "write" } else { "read" };
+        let fs_magic = event.fs_magic as u64;
 
-        metrics.duration_histogram.record(duration_ns, &attrs);
+        let attrs = self
+            .attrs_cache
+            .entry((event.cgroup_id, io_type, fs_magic))
+            .or_insert_with(|| {
+                let mut attrs = vec![
+                    KeyValue::new("io.type", io_type_name),
+                    KeyValue::new("cgroup.name", metrics.name.clone()),
+                    KeyValue::new("fs.magic", format!("{:#x}", fs_magic)),
+                ];
+                if let Some(fs_name) = event.fs_magic.magic_to_pretty_name() {
+                    attrs.push(KeyValue::new("fs.type", fs_name));
+                }
+                // see opentelemetry-sdk sort_and_dedup
+                attrs.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+                attrs.dedup_by(|a, b| a.key == b.key);
+                Arc::from(attrs)
+            });
+
+        metrics
+            .duration_histogram
+            .record(duration_ns, attrs.as_ref());
         metrics.size_histogram.record(
             (event.num_bytes_transferred & 0b01111111111111111111111111111111) as u64,
-            &attrs,
+            attrs.as_ref(),
         );
     }
 
@@ -97,6 +109,8 @@ impl IoMetrics {
             .map(|elem| *elem.key())
             .filter(|id| !live.contains(id))
             .collect();
+        let dead_set: FxHashSet<u64> = dead.iter().copied().collect();
+
         for id in dead {
             if let Some(cg) = self.cgroups.remove(&id) {
                 let name = &cg.1.name;
@@ -105,6 +119,11 @@ impl IoMetrics {
                     log::warn!("Failed to shut down provider for cgroup {name}: {e}");
                 }
             }
+        }
+
+        if !dead_set.is_empty() {
+            self.attrs_cache
+                .retain(|(cgroup_id, _, _), _| !dead_set.contains(cgroup_id));
         }
     }
 
