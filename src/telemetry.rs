@@ -184,7 +184,7 @@ impl IoMetrics {
             .with_view(size_view)
             .build();
 
-        let meter = provider.meter("hpc-otel-collector");
+        let meter = provider.meter("hpc-otel-exporter");
 
         let duration_histogram = meter
             .u64_histogram("io.duration")

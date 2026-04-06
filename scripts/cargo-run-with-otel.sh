@@ -21,7 +21,7 @@ fi
 podman compose -f "$COMPOSE_FILE" up -d
 
 exec sudo env \
-  OTEL_SERVICE_NAME=hpc-otel-collector \
+  OTEL_SERVICE_NAME=hpc-otel-exporter \
   OTEL_METRICS_EXPORTER=otlp \
   OTEL_EXPORTER_OTLP_PROTOCOL=grpc \
   OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 \
