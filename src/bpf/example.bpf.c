@@ -42,14 +42,16 @@ static __always_inline void record_start(const struct file *file) {
     }
 
     struct task_struct *task = bpf_get_current_task_btf();
-    u64 *start_time = bpf_task_storage_get(&TASK_STORAGE, task, NULL, BPF_LOCAL_STORAGE_GET_F_CREATE);
+    u64 *start_time = bpf_task_storage_get(&TASK_STORAGE, task, NULL,
+                                           BPF_LOCAL_STORAGE_GET_F_CREATE);
     if (start_time == NULL) {
         return;
     }
     *start_time = bpf_ktime_get_ns();
 }
 
-static __always_inline void record_end(const struct file *file, const s64 ret, const bool is_write) {
+static __always_inline void record_end(const struct file *file, const s64 ret,
+                                       const bool is_write) {
     const u64 end_time = bpf_ktime_get_ns();
 
     if (ret <= 0) {
@@ -62,7 +64,8 @@ static __always_inline void record_end(const struct file *file, const s64 ret, c
         return;
     }
 
-    struct IOEvent *const event = bpf_ringbuf_reserve(&EVENTS, sizeof(struct IOEvent), 0);
+    struct IOEvent *const event =
+        bpf_ringbuf_reserve(&EVENTS, sizeof(struct IOEvent), 0);
     if (event == NULL) {
         return;
     }
@@ -102,29 +105,29 @@ static __always_inline void record_end(const struct file *file, const s64 ret, c
 }
 
 SEC("fentry/vfs_read")
-int BPF_PROG(record_vfs_read_entry, const struct file *file, char * /*buf*/, const u64 /*count*/,
-             loff_t * /*pos*/) {
+int BPF_PROG(record_vfs_read_entry, const struct file *file, char * /*buf*/,
+             const u64 /*count*/, loff_t * /*pos*/) {
     record_start(file);
     return 0;
 }
 
 SEC("fentry/vfs_write")
-int BPF_PROG(record_vfs_write_entry, const struct file *file, char * /*buf*/, const u64 /*count*/,
-             loff_t * /*pos*/) {
+int BPF_PROG(record_vfs_write_entry, const struct file *file, char * /*buf*/,
+             const u64 /*count*/, loff_t * /*pos*/) {
     record_start(file);
     return 0;
 }
 
 SEC("fexit/vfs_read")
-int BPF_PROG(record_vfs_read_exit, const struct file *file, char * /*buf*/, const u64 /*count*/,
-             loff_t * /*pos*/, const s64 ret) {
+int BPF_PROG(record_vfs_read_exit, const struct file *file, char * /*buf*/,
+             const u64 /*count*/, loff_t * /*pos*/, const s64 ret) {
     record_end(file, ret, false);
     return 0;
 }
 
 SEC("fexit/vfs_write")
-int BPF_PROG(record_vfs_write_exit, const struct file *file, char * /*buf*/, const u64 /*count*/,
-             loff_t * /*pos*/, const s64 ret) {
+int BPF_PROG(record_vfs_write_exit, const struct file *file, char * /*buf*/,
+             const u64 /*count*/, loff_t * /*pos*/, const s64 ret) {
     record_end(file, ret, true);
     return 0;
 }

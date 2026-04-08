@@ -50,7 +50,9 @@ fn main() {
         // generated vmlinux.h is incompatible with C23 native bool as of 2026 :(
         "-std=gnu17",
         "-Wno-c23-extensions",
-        "-I",
+        "-Wall",
+        "-Werror",
+        "-isystem",
         bpf_headers_dir.to_str().unwrap(),
         "-mcpu=v3",
     ];
