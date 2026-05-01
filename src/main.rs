@@ -156,37 +156,17 @@ async fn main() -> Result<()> {
 
     // Periodically clean up providers for cgroups that no longer exist.
     let mut cleanup_interval = tokio::time::interval(Duration::from_secs(5));
-    // Fallback poll to recover from potential missed readiness notifications.
-    let mut fallback_poll_interval = tokio::time::interval(Duration::from_millis(100));
 
     loop {
         tokio::select! {
-            readable = async_fd.readable() => {
-                let mut guard = readable?;
-                // Drain until no data is left. `try_io` avoids missing wakeups
-                // if readiness changes between consume and readiness bookkeeping.
-                loop {
-                    match guard.try_io(|_| {
-                        let consumed = ring.consume()?;
-                        if consumed == 0 {
-                            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
-                        } else {
-                            Ok(consumed)
-                        }
-                    }) {
-                        Ok(Ok(_consumed)) => {}
-                        Ok(Err(err)) => {
-                            return Err(anyhow::anyhow!("ring_buffer__consume failed: {err}"));
-                        }
-                        Err(_would_block) => break,
-                    }
+            _ = async_fd.async_io(tokio::io::Interest::READABLE, |_| {
+                let consumed = ring.consume()?;
+                match consumed {
+                    n if n > 0 => Ok(n),
+                    0 => Err(std::io::ErrorKind::WouldBlock.into()),
+                    n => Err(std::io::Error::from_raw_os_error(-n)),
                 }
-            }
-            _ = fallback_poll_interval.tick() => {
-                if let Err(err) = ring.poll(0) {
-                    return Err(anyhow::anyhow!("ring_buffer__poll fallback failed: {err}"));
-                }
-            }
+            }) => {},
             _ = cleanup_interval.tick() => {
                 context_guard.io_metrics.cleanup_dead_cgroups();
             }
