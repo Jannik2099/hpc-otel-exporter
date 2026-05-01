@@ -31,8 +31,7 @@ struct CgroupMetrics {
 pub struct IoMetrics {
     cgroups: DashMap<u64, CgroupMetrics, FxBuildHasher>,
     attrs_cache: DashMap<(u64, bool, u64), Arc<[KeyValue]>, FxBuildHasher>,
-    /// Hostname, resolved once at construction.
-    host: Arc<str>,
+    resource: Resource,
 }
 
 impl IoMetrics {
@@ -42,12 +41,17 @@ impl IoMetrics {
         let mut buf = [0u8; 4096];
         let _ = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
         let hostname = CStr::from_bytes_until_nul(&buf)
-            .unwrap_or_else(|_| CStr::from_bytes_with_nul(b"unknown\0").unwrap());
+            .unwrap_or_else(|_| CStr::from_bytes_with_nul(b"unknown\0").unwrap())
+            .to_str()
+            .unwrap_or("unknown")
+            .to_owned();
 
         Self {
             cgroups: DashMap::default(),
             attrs_cache: DashMap::default(),
-            host: Arc::from(hostname.to_string_lossy().into_owned()),
+            resource: Resource::builder()
+                .with_attributes([KeyValue::new("host.name", hostname)])
+                .build(),
         }
     }
 
@@ -132,10 +136,6 @@ impl IoMetrics {
 
         log::info!("Adding cgroup {name}");
 
-        let resource = Resource::builder()
-            .with_attributes([KeyValue::new("host.name", self.host.to_string())])
-            .build();
-
         let duration_view = move |inst: &Instrument| {
             if inst.name() == "io.duration" {
                 Stream::builder()
@@ -179,7 +179,7 @@ impl IoMetrics {
 
         let provider = SdkMeterProvider::builder()
             .with_periodic_exporter(exporter)
-            .with_resource(resource)
+            .with_resource(self.resource.clone())
             .with_view(duration_view)
             .with_view(size_view)
             .build();
