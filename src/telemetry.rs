@@ -3,13 +3,46 @@ use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Histogram, MeterProvider};
 use opentelemetry_otlp::{MetricExporter, Protocol, WithExportConfig};
 use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::metrics::{Aggregation, Instrument, SdkMeterProvider, Stream};
+use opentelemetry_sdk::error::OTelSdkResult;
+use opentelemetry_sdk::metrics::Temporality;
+use opentelemetry_sdk::metrics::data::ResourceMetrics;
+use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
+use opentelemetry_sdk::metrics::{
+    Aggregation, Instrument, PeriodicReader, SdkMeterProvider, Stream,
+};
 use rustc_hash::{FxBuildHasher, FxHashSet};
 use std::ffi::CStr;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
+
+#[derive(Clone)]
+struct SharedExporter(Arc<MetricExporter>);
+
+impl PushMetricExporter for SharedExporter {
+    async fn export(&self, metrics: &ResourceMetrics) -> OTelSdkResult {
+        self.0.export(metrics).await
+    }
+
+    fn force_flush(&self) -> OTelSdkResult {
+        self.0.force_flush()
+    }
+
+    fn shutdown(&self) -> OTelSdkResult {
+        // Do not shutdown the shared exporter when a single reader shuts down.
+        Ok(())
+    }
+
+    fn shutdown_with_timeout(&self, _timeout: Duration) -> OTelSdkResult {
+        Ok(())
+    }
+
+    fn temporality(&self) -> Temporality {
+        self.0.temporality()
+    }
+}
 
 use crate::bindings;
 
@@ -32,6 +65,7 @@ pub struct IoMetrics {
     cgroups: DashMap<u64, CgroupMetrics, FxBuildHasher>,
     attrs_cache: DashMap<(u64, bool, u64), Arc<[KeyValue]>, FxBuildHasher>,
     resource: Resource,
+    exporter: SharedExporter,
 }
 
 impl IoMetrics {
@@ -46,12 +80,19 @@ impl IoMetrics {
             .unwrap_or("unknown")
             .to_owned();
 
+        let exporter = MetricExporter::builder()
+            .with_tonic()
+            .with_protocol(Protocol::Grpc)
+            .build()
+            .expect("failed to create OTLP metric exporter");
+
         Self {
             cgroups: DashMap::default(),
             attrs_cache: DashMap::default(),
             resource: Resource::builder()
                 .with_attributes([KeyValue::new("host.name", hostname)])
                 .build(),
+            exporter: SharedExporter(Arc::new(exporter)),
         }
     }
 
@@ -171,14 +212,12 @@ impl IoMetrics {
             }
         };
 
-        let exporter = MetricExporter::builder()
-            .with_tonic()
-            .with_protocol(Protocol::Grpc)
-            .build()
-            .expect("failed to create OTLP metric exporter");
+        // Create a new PeriodicReader instance for each SdkMeterProvider
+        // but reuse the underlying Grpc connection/configuration.
+        let reader = PeriodicReader::builder(self.exporter.clone()).build();
 
         let provider = SdkMeterProvider::builder()
-            .with_periodic_exporter(exporter)
+            .with_reader(reader)
             .with_resource(self.resource.clone())
             .with_view(duration_view)
             .with_view(size_view)
