@@ -1,12 +1,12 @@
 use std::mem::MaybeUninit;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
-use std::ptr::NonNull;
+use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use libbpf_rs::RingBufferBuilder;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
-use log::{debug, info, warn};
+use log::{debug, info};
 use tokio::io::unix::AsyncFd;
 use tokio::signal;
 
@@ -20,86 +20,12 @@ mod example {
 
 use example::*;
 
-/// Wrapper around libbpf_sys ring_buffer for safe usage
-struct RingBuffer {
-    ptr: NonNull<libbpf_sys::ring_buffer>,
-}
-
-impl RingBuffer {
-    unsafe fn new(
-        map_fd: i32,
-        sample_cb: libbpf_sys::ring_buffer_sample_fn,
-        ctx: *mut std::ffi::c_void,
-    ) -> Result<Self> {
-        let opts = libbpf_sys::ring_buffer_opts {
-            sz: std::mem::size_of::<libbpf_sys::ring_buffer_opts>() as libbpf_sys::size_t,
-        };
-
-        let ptr = unsafe { libbpf_sys::ring_buffer__new(map_fd, sample_cb, ctx, &opts) };
-
-        NonNull::new(ptr)
-            .context("ring_buffer__new returned null")
-            .map(|ptr| Self { ptr })
-    }
-
-    fn epoll_fd(&self) -> i32 {
-        unsafe { libbpf_sys::ring_buffer__epoll_fd(self.ptr.as_ptr()) }
-    }
-
-    fn consume(&self) -> std::io::Result<i32> {
-        let ret = unsafe { libbpf_sys::ring_buffer__consume(self.ptr.as_ptr()) };
-        if ret < 0 {
-            return Err(std::io::Error::from_raw_os_error(-ret));
-        }
-        Ok(ret)
-    }
-
-    fn poll(&self, timeout_ms: i32) -> std::io::Result<i32> {
-        let ret = unsafe { libbpf_sys::ring_buffer__poll(self.ptr.as_ptr(), timeout_ms) };
-        if ret < 0 {
-            return Err(std::io::Error::from_raw_os_error(-ret));
-        }
-        Ok(ret)
-    }
-}
-
-impl Drop for RingBuffer {
-    fn drop(&mut self) {
-        unsafe { libbpf_sys::ring_buffer__free(self.ptr.as_ptr()) }
-    }
-}
-
-unsafe impl Send for RingBuffer {}
-unsafe impl Sync for RingBuffer {}
+use crate::bindings::IOEvent;
 
 /// Context passed to ring buffer callbacks
 struct CallbackContext {
     event_count: std::sync::atomic::AtomicU64,
     io_metrics: telemetry::IoMetrics,
-}
-
-/// C-compatible callback for ring buffer events
-unsafe extern "C" fn event_callback(
-    ctx: *mut std::ffi::c_void,
-    data: *mut std::ffi::c_void,
-    size: libbpf_sys::size_t,
-) -> i32 {
-    if size < std::mem::size_of::<bindings::IOEvent>() as libbpf_sys::size_t {
-        warn!("received truncated event ({} bytes)", size);
-        return 0;
-    }
-
-    let event = unsafe { (data as *const bindings::IOEvent).read_unaligned() };
-
-    if !ctx.is_null() {
-        let context = unsafe { &*(ctx as *const CallbackContext) };
-        context
-            .event_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        context.io_metrics.record(&event);
-    }
-
-    0
 }
 
 #[tokio::main]
@@ -132,18 +58,35 @@ async fn main() -> Result<()> {
     info!("eBPF program loaded and attached!");
 
     // Create callback context
-    let io_metrics = telemetry::IoMetrics::new();
     let context = Arc::new(CallbackContext {
         event_count: std::sync::atomic::AtomicU64::new(0),
-        io_metrics,
+        io_metrics: telemetry::IoMetrics::new(),
     });
-    let ctx_ptr = Arc::as_ptr(&context) as *mut std::ffi::c_void;
+    let callback_context = Arc::clone(&context);
 
-    let map_fd = skel.maps.EVENTS.as_fd().as_raw_fd();
-    let ring = unsafe { RingBuffer::new(map_fd, Some(event_callback), ctx_ptr)? };
+    let event_callback = |data: &[u8]| {
+        if data.len() < std::mem::size_of::<IOEvent>() {
+            return 0;
+        }
+        // Safety: BPF ringbuf data is aligned to 8 bytes
+        // Event requires 4-byte alignment.
+        // The length check above guarantees sufficient size.
+        let event = unsafe { &*(data.as_ptr() as *const IOEvent) };
+
+        callback_context
+            .event_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        callback_context.io_metrics.record(&event);
+
+        0
+    };
+
+    let mut rb_builder = RingBufferBuilder::new();
+    rb_builder.add(&skel.maps.EVENTS, event_callback)?;
+    let ringbuf = rb_builder.build()?;
 
     // Wrap the ring buffer's epoll fd with tokio's AsyncFd for async polling.
-    let epoll_fd = ring.epoll_fd();
+    let epoll_fd = ringbuf.epoll_fd();
     let async_fd = AsyncFd::with_interest(
         unsafe { BorrowedFd::borrow_raw(epoll_fd) },
         tokio::io::Interest::READABLE,
@@ -151,16 +94,13 @@ async fn main() -> Result<()> {
 
     info!("Waiting for events... Press Ctrl-C to exit.");
 
-    // Keep context alive for the duration of the program
-    let context_guard = context;
-
     // Periodically clean up providers for cgroups that no longer exist.
     let mut cleanup_interval = tokio::time::interval(Duration::from_secs(5));
 
     loop {
         tokio::select! {
             _ = async_fd.async_io(tokio::io::Interest::READABLE, |_| {
-                let consumed = ring.consume()?;
+                let consumed = ringbuf.consume_raw();
                 match consumed {
                     n if n > 0 => Ok(n),
                     0 => Err(std::io::ErrorKind::WouldBlock.into()),
@@ -168,7 +108,7 @@ async fn main() -> Result<()> {
                 }
             }) => {},
             _ = cleanup_interval.tick() => {
-                context_guard.io_metrics.cleanup_dead_cgroups();
+                context.io_metrics.cleanup_dead_cgroups();
             }
             _ = signal::ctrl_c() => {
                 info!("Ctrl-C received, exiting...");
