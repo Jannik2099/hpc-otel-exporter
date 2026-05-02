@@ -11,6 +11,8 @@ use tokio::io::unix::AsyncFd;
 use tokio::signal;
 
 mod bindings;
+#[cfg(feature = "pyroscope")]
+mod pyroscope;
 mod telemetry;
 
 // Include the generated skeleton module
@@ -32,6 +34,9 @@ struct CallbackContext {
 async fn main() -> Result<()> {
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
     env_logger::init_from_env(env);
+
+    #[cfg(feature = "pyroscope")]
+    let _pyroscope_agent = pyroscope::setup_pyroscope();
 
     // Bump the memlock rlimit. This is needed for older kernels that don't use the
     // new memcg based accounting, see https://lwn.net/Articles/837122/

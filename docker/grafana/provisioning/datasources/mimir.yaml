@@ -11,4 +11,4 @@ datasources:
       timeInterval: 5s
       prometheusType: Mimir
       prometheusVersion: "2.9.1"
-    editable: false
+    editable: true

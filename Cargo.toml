@@ -24,6 +24,12 @@ opentelemetry_sdk = { version = "0.31.0", features = [
 ] }
 rustc-hash = "2"
 tokio = { version = "1.48", features = ["full"] }
+pyroscope = { version = "2.0.3", features = [
+    "backend-pprof-rs",
+], optional = true }
+
+[features]
+pyroscope = ["dep:pyroscope"]
 
 [build-dependencies]
 libbpf-cargo = "0.26.0"

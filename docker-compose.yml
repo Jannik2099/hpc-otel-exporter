@@ -6,10 +6,20 @@ services:
     volumes:
       - ./docker/mimir/mimir.yaml:/etc/mimir/mimir.yaml:ro
 
+  pyroscope:
+    image: docker.io/grafana/pyroscope:latest
+    ports:
+      - "4040:4040"
+    command:
+      - -config.file=/etc/pyroscope/pyroscope.yaml
+    volumes:
+      - ./docker/pyroscope/pyroscope.yaml:/etc/pyroscope/pyroscope.yaml:ro
+
   grafana:
     image: docker.io/grafana/grafana:latest
     depends_on:
       - mimir
+      - pyroscope
     ports:
       - "3000:3000"
     environment:
