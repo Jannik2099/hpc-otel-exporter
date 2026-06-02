@@ -1,6 +1,6 @@
 use dashmap::DashMap;
 use opentelemetry::KeyValue;
-use opentelemetry::metrics::{Histogram, MeterProvider};
+use opentelemetry::metrics::{BoundHistogram, Histogram, MeterProvider};
 use opentelemetry_otlp::{MetricExporter, Protocol, WithExportConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::error::OTelSdkResult;
@@ -54,6 +54,11 @@ struct CgroupMetrics {
     size_histogram: Histogram<u64>,
 }
 
+struct BoundCgroupMetrics {
+    duration_histogram: BoundHistogram<u64>,
+    size_histogram: BoundHistogram<u64>,
+}
+
 /// Manages one [`SdkMeterProvider`] per cgroup.
 ///
 /// Each provider carries hostname as a *resource* attribute, while per-event
@@ -63,7 +68,7 @@ struct CgroupMetrics {
 /// longer exported.
 pub struct IoMetrics {
     cgroups: DashMap<u64, CgroupMetrics, FxBuildHasher>,
-    attrs_cache: DashMap<(u64, bool, u64), Arc<[KeyValue]>, FxBuildHasher>,
+    attrs_to_metrics: DashMap<(u64, bool, u64), BoundCgroupMetrics, FxBuildHasher>,
     resource: Resource,
     exporter: SharedExporter,
 }
@@ -88,7 +93,7 @@ impl IoMetrics {
 
         Self {
             cgroups: DashMap::default(),
-            attrs_cache: DashMap::default(),
+            attrs_to_metrics: DashMap::default(),
             resource: Resource::builder()
                 .with_attributes([KeyValue::new("host.name", hostname)])
                 .build(),
@@ -117,8 +122,8 @@ impl IoMetrics {
         let io_type_name = if io_type { "write" } else { "read" };
         let fs_magic = event.fs_magic as u64;
 
-        let attrs = self
-            .attrs_cache
+        let histograms = self
+            .attrs_to_metrics
             .entry((event.cgroup_id, io_type, fs_magic))
             .or_insert_with(|| {
                 let mut attrs = vec![
@@ -132,16 +137,18 @@ impl IoMetrics {
                 // see opentelemetry-sdk sort_and_dedup
                 attrs.sort_unstable_by(|a, b| a.key.cmp(&b.key));
                 attrs.dedup_by(|a, b| a.key == b.key);
-                Arc::from(attrs)
+                let duration_histogram = metrics.duration_histogram.bind(&attrs);
+                let size_histogram = metrics.size_histogram.bind(&attrs);
+                BoundCgroupMetrics {
+                    duration_histogram,
+                    size_histogram,
+                }
             });
 
-        metrics
-            .duration_histogram
-            .record(duration_ns, attrs.as_ref());
-        metrics.size_histogram.record(
-            (event.num_bytes_transferred & 0b01111111111111111111111111111111) as u64,
-            attrs.as_ref(),
-        );
+        histograms.duration_histogram.record(duration_ns);
+        histograms
+            .size_histogram
+            .record((event.num_bytes_transferred & 0b01111111111111111111111111111111) as u64);
     }
 
     /// Walk `/sys/fs/cgroup`, collect all live cgroup inode numbers, and shut
@@ -167,7 +174,7 @@ impl IoMetrics {
         }
 
         if !dead_set.is_empty() {
-            self.attrs_cache
+            self.attrs_to_metrics
                 .retain(|(cgroup_id, _, _), _| !dead_set.contains(cgroup_id));
         }
     }
