@@ -12,13 +12,13 @@ libbpf-rs = "0.26.0"
 libbpf-sys = "1.6.3"
 libc = "0.2"
 log = "0.4"
-opentelemetry = { version = "0.31.0", features = ["metrics"] }
-opentelemetry-otlp = { version = "0.31.0", default-features = false, features = [
+opentelemetry = { version = "0.32", features = ["metrics"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "metrics",
     "grpc-tonic",
     "tls-roots",
 ] }
-opentelemetry_sdk = { version = "0.31.0", features = [
+opentelemetry_sdk = { version = "0.32", features = [
     "metrics",
     "spec_unstable_metrics_views",
 ] }
@@ -27,6 +27,7 @@ tokio = { version = "1.48", features = ["full"] }
 pyroscope = { version = "2.0.3", features = [
     "backend-pprof-rs",
 ], optional = true }
+clap = { version = "4.6.1", features = ["derive"] }
 
 [features]
 pyroscope = ["dep:pyroscope"]

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use clap::Parser;
 use libbpf_rs::RingBufferBuilder;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use log::{debug, info};
@@ -24,6 +25,13 @@ use example::*;
 
 use crate::bindings::IOEvent;
 
+#[derive(Debug, Parser)]
+struct Args {
+    /// test whether attaching the eBPF programs succeeds and exit
+    #[arg(long)]
+    test_attach: bool,
+}
+
 /// Context passed to ring buffer callbacks
 struct CallbackContext {
     event_count: std::sync::atomic::AtomicU64,
@@ -32,6 +40,8 @@ struct CallbackContext {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
     let env = env_logger::Env::default().filter_or("RUST_LOG", "info");
     env_logger::init_from_env(env);
 
@@ -61,6 +71,10 @@ async fn main() -> Result<()> {
     skel.attach()?;
 
     info!("eBPF program loaded and attached!");
+
+    if args.test_attach {
+        return Ok(());
+    }
 
     // Create callback context
     let context = Arc::new(CallbackContext {

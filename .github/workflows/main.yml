@@ -1,0 +1,244 @@
+name: Main
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build_mkosi_tools:
+    strategy:
+      matrix:
+        distro: [rocky, ubuntu]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        id: cache
+        with:
+          path: target/mkosi.tools.${{ matrix.distro }}.tar.gz
+          key: mkosi-tools-${{ runner.arch }}-${{ matrix.distro }}-${{ hashFiles('mkosi/tools/**') }}
+
+      - run: sudo apt-get update
+        if: steps.cache.outputs.cache-hit != 'true'
+
+      - uses: systemd/mkosi@84af20892b61c8e177e391f997ded8b4cb5514f2 # v26
+        if: steps.cache.outputs.cache-hit != 'true'
+
+      - name: Build mkosi tools
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkosi -C mkosi/tools/${{ matrix.distro }} build
+          sudo tar -czf target/mkosi.tools.${{ matrix.distro }}.tar.gz target/mkosi.tools
+
+      - name: Upload mkosi tools
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: target/mkosi.tools.${{ matrix.distro }}.tar.gz
+          if-no-files-found: error
+          archive: false
+
+  build_and_test:
+    strategy:
+      matrix:
+        include:
+          - distro: rocky
+            release: "10"
+            mirror: https://dl.rockylinux.org/pub/rocky
+          - distro: rocky
+            release: "9"
+            mirror: https://dl.rockylinux.org/pub/rocky
+          - distro: ubuntu
+            release: "26.04"
+            mirror: http://archive.ubuntu.com/ubuntu
+          - distro: ubuntu
+            release: "24.04"
+            mirror: http://archive.ubuntu.com/ubuntu
+      fail-fast: false
+    needs: build_mkosi_tools
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure env vars
+        run: |
+          if [[ "${{ matrix.distro }}" == "ubuntu" ]]; then
+            case ${{ matrix.release }} in
+              "26.04") echo "MKOSI_RELEASE=resolute" >> $GITHUB_ENV ;;
+              "24.04") echo "MKOSI_RELEASE=noble" >> $GITHUB_ENV ;;
+            esac
+          else
+            echo "MKOSI_RELEASE=${{ matrix.release }}" >> $GITHUB_ENV
+          fi
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: systemd/mkosi@84af20892b61c8e177e391f997ded8b4cb5514f2 # v26
+
+      - name: Setup systemd-machined
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends systemd-container
+          sudo systemctl start systemd-machined
+
+      - name: Download mkosi tools
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: mkosi.tools.${{ matrix.distro }}.tar.gz
+          path: target/
+
+      - name: Extract mkosi tools
+        run: |
+          sudo tar -xzf target/mkosi.tools.${{ matrix.distro }}.tar.gz
+
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        id: cache-vm
+        with:
+          path: |
+            target/mkosi.output/${{ matrix.distro }}-${{ env.MKOSI_RELEASE }}-vm
+            target/mkosi.output/${{ matrix.distro }}-${{ env.MKOSI_RELEASE }}-vm.initrd
+            target/mkosi.output/${{ matrix.distro }}-${{ env.MKOSI_RELEASE }}-vm.raw
+            target/mkosi.output/${{ matrix.distro }}-${{ env.MKOSI_RELEASE }}-vm.vmlinuz
+            mkosi/vm/mkosi.crt
+            mkosi/vm/mkosi.key
+          key: mkosi-vm-${{ runner.arch }}-${{ matrix.distro }}-${{ matrix.release }}-${{ hashFiles('mkosi/base.conf', 'mkosi/vm/**') }}-${{ hashFiles('target/mkosi.tools.*.tar.gz') }}
+
+      - name: Build VM
+        if: steps.cache-vm.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkosi \
+            -C mkosi/vm \
+            --distribution ${{ matrix.distro }} \
+            --release ${MKOSI_RELEASE} \
+            --mirror ${{ matrix.mirror }} \
+            genkey
+          mkosi \
+            -C mkosi/vm \
+            --distribution ${{ matrix.distro }} \
+            --release ${MKOSI_RELEASE} \
+            --mirror ${{ matrix.mirror }} \
+            build
+
+      - name: Generate vmlinux.h
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          mkdir -p target/bpf_headers
+          sudo mkosi \
+            -C mkosi/vm \
+            --distribution ${{ matrix.distro }} \
+            --release ${MKOSI_RELEASE} \
+            --mirror ${{ matrix.mirror }} \
+            vm >> vm.log 2>&1 &
+          VM_PID=$!
+          until sudo mkosi \
+            -C mkosi/vm \
+            --distribution ${{ matrix.distro }} \
+            --release ${MKOSI_RELEASE} \
+            --mirror ${{ matrix.mirror }} \
+            ssh -- true; do
+            sleep 1
+            if ! ps -p ${VM_PID} > /dev/null; then
+                echo "VM failed to start"
+                exit 1
+            fi
+          done
+          BPFTOOL='bpftool'
+          if [[ ${{ matrix.distro}} == "ubuntu" ]]; then
+            case ${{ matrix.release }} in
+              "24.04") BPFTOOL='/usr/lib/linux-tools/$(uname -r)/bpftool' ;;
+            esac
+          fi
+          sudo mkosi \
+            -C mkosi/vm \
+            --distribution ${{ matrix.distro }} \
+            --release ${MKOSI_RELEASE} \
+            --mirror ${{ matrix.mirror }} \
+            ssh -- "${BPFTOOL} btf dump file /sys/kernel/btf/vmlinux format c" > target/bpf_headers/vmlinux.h
+          sudo mkosi \
+            -C mkosi/vm \
+            --distribution ${{ matrix.distro }} \
+            --release ${MKOSI_RELEASE} \
+            --mirror ${{ matrix.mirror }} \
+            ssh -- systemctl poweroff || true
+          wait ${VM_PID}
+
+      - name: Upload vmlinux.h
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vmlinux-${{ matrix.distro }}-${{ matrix.release }}.h
+          path: target/bpf_headers/vmlinux.h
+          if-no-files-found: error
+
+      - name: Build program
+        run: |
+          set -euo pipefail
+          mkosi \
+            -C mkosi/runtime \
+            --distribution ${{ matrix.distro }} \
+            --release ${MKOSI_RELEASE} \
+            --mirror ${{ matrix.mirror }} \
+            build
+
+      - name: Test attaching
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          sudo mkosi \
+            -C mkosi/vm \
+            --distribution ${{ matrix.distro }} \
+            --release ${MKOSI_RELEASE} \
+            --mirror ${{ matrix.mirror }} \
+            vm >> vm.log 2>&1 &
+          VM_PID=$!
+          until sudo mkosi \
+            -C mkosi/vm \
+            --distribution ${{ matrix.distro }} \
+            --release ${MKOSI_RELEASE} \
+            --mirror ${{ matrix.mirror }} \
+            ssh -- true; do
+            sleep 1
+            if ! ps -p ${VM_PID} > /dev/null; then
+                echo "VM failed to start"
+                exit 1
+            fi
+          done
+          sudo mkosi \
+            -C mkosi/vm \
+            --distribution ${{ matrix.distro }} \
+            --release ${MKOSI_RELEASE} \
+            --mirror ${{ matrix.mirror }} \
+            ssh -- "cat > /usr/local/bin/hpc-otel-exporter && chmod +x /usr/local/bin/hpc-otel-exporter" < target/mkosi.output/${{ matrix.distro }}-${MKOSI_RELEASE}-runtime/usr/local/bin/hpc-otel-exporter
+          sudo mkosi \
+            -C mkosi/vm \
+            --distribution ${{ matrix.distro }} \
+            --release ${MKOSI_RELEASE} \
+            --mirror ${{ matrix.mirror }} \
+            ssh -- /usr/local/bin/hpc-otel-exporter --test-attach
+          sudo mkosi \
+            -C mkosi/vm \
+            --distribution ${{ matrix.distro }} \
+            --release ${MKOSI_RELEASE} \
+            --mirror ${{ matrix.mirror }} \
+            ssh -- systemctl poweroff || true
+          wait ${VM_PID}
+
+      - name: Upload program
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.distro }}-${{ matrix.release }}-hpc-otel-exporter
+          path: target/mkosi.output/${{ matrix.distro }}-${{ env.MKOSI_RELEASE }}-runtime/usr/local/bin/hpc-otel-exporter
+          if-no-files-found: error
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: vm.log
+          name: ${{ matrix.distro }}-${{ matrix.release }}-logs
