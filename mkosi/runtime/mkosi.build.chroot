@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+
+set -xeuo pipefail
+
+export HOME=/root
+
+source "${HOME}/.cargo/env"
+
+cd "${SRCDIR}/hpc-otel-exporter"
+cargo build --release --locked
+mkdir -p "${DESTDIR}/usr/local/bin/"
+cp target/release/hpc-otel-exporter "${DESTDIR}/usr/local/bin/"
