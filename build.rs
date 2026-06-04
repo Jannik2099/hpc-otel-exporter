@@ -1,8 +1,21 @@
 use libbpf_cargo::SkeletonBuilder;
 use std::{env, fs, path::PathBuf, process::Command};
 
-const SRC: &str = "src/bpf/example.bpf.c";
-const SHARED_HEADER: &str = "src/bpf/common_shared.h";
+const SRC: &str = "src/bpf/exporter.bpf.c";
+/// Bindgen entry point: aggregates every per-feature shared-type header so all
+/// shared structs/enums/constants land in one `crate::bindings` module.
+const SHARED_HEADER: &str = "src/bpf/shared.h";
+/// BPF sources/headers `#include`d into [`SRC`]. Changing any of them must
+/// retrigger the skeleton + bindgen build, but only `SRC` is compiled.
+const BPF_FRAGMENTS: &[&str] = &[
+    "src/bpf/io.bpf.c",
+    "src/bpf/profiling.bpf.c",
+    "src/bpf/io.h",
+    "src/bpf/profiling.h",
+    "src/bpf/prelude.h",
+];
+const PPROF_PROTO: &str = "profile.proto";
+const PUSH_PROTO: &str = "pyroscope_push.proto";
 
 fn main() {
     let out_dir =
@@ -55,6 +68,9 @@ fn main() {
         "-isystem",
         bpf_headers_dir.to_str().unwrap(),
         "-mcpu=v3",
+        // bpf_tracing.h's PT_REGS_* macros need the target arch spelled out
+        // this is just for compile_commands.json
+        "-D__TARGET_ARCH_x86",
     ];
     generate_compile_commands(&extra_clang_args);
 
@@ -63,7 +79,7 @@ fn main() {
 
     // Build the BPF skeleton
     let mut skel_path = out_dir.clone();
-    skel_path.push("example.skel.rs");
+    skel_path.push("exporter.skel.rs");
 
     SkeletonBuilder::new()
         .source(SRC)
@@ -71,8 +87,34 @@ fn main() {
         .build_and_generate(&skel_path)
         .expect("bpf compilation failed");
 
+    let perf_bindings = bindgen::Builder::default()
+        .header("bindgen/perf_event.h")
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        .generate()
+        .expect("Unable to generate perf_event bindings");
+
+    perf_bindings
+        .write_to_file(out_dir.join("perf_event_bindings.rs"))
+        .expect("Couldn't write perf_event bindings!");
+
+    // Compile the protobuf definitions:
+    // pprof (package google.v1 -> google.v1.rs)
+    // Pyroscope push API (package push.v1 -> push.v1.rs).
+    if env::var_os("PROTOC").is_none()
+        && let Ok(protoc) = protoc_bin_vendored::protoc_bin_path()
+    {
+        unsafe { env::set_var("PROTOC", protoc) };
+    }
+    prost_build::compile_protos(&[PPROF_PROTO, PUSH_PROTO], &["."])
+        .expect("failed to compile protobuf definitions");
+    println!("cargo:rerun-if-changed={}", PPROF_PROTO);
+    println!("cargo:rerun-if-changed={}", PUSH_PROTO);
+
     println!("cargo:rerun-if-changed={}", SRC);
     println!("cargo:rerun-if-changed={}", SHARED_HEADER);
+    for fragment in BPF_FRAGMENTS {
+        println!("cargo:rerun-if-changed={fragment}");
+    }
 }
 
 fn get_target_dir() -> PathBuf {
@@ -142,6 +184,22 @@ fn generate_bindings(bpf_headers_dir: &PathBuf, out_dir: &PathBuf) {
         .allowlist_type("IOType")
         .rustified_enum("IOType")
         .allowlist_type("IOEvent")
+        .allowlist_type("StackKey")
+        // Native-unwinder shared types (src/bpf/common_shared.h).
+        .allowlist_type("UnwindRow")
+        .allowlist_type("UnwindMiss")
+        .allowlist_type("MappingEntry")
+        .allowlist_type("ProcessMappings")
+        .allowlist_type("ExecInfo")
+        .allowlist_type("Stack")
+        .allowlist_type("CfaType")
+        .allowlist_type("RbpRule")
+        .allowlist_var("MAX_STACK_DEPTH")
+        .allowlist_var("MAX_ROWS_PER_EXEC")
+        .allowlist_var("MAX_EXECUTABLES")
+        .allowlist_var("MAX_MAPPINGS_PER_PROC")
+        .rustified_enum("CfaType")
+        .rustified_enum("RbpRule")
         // Make the enum a proper Rust enum with variants
         .rustified_non_exhaustive_enum("FsMagic")
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))

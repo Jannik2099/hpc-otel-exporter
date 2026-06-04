@@ -1,0 +1,36 @@
+// Minimal subset of Grafana Pyroscope's push API
+// (github.com/grafana/pyroscope/api/push/v1/push.proto and the referenced
+// types/v1 LabelPair). Only the messages needed to call
+// `/push.v1.PusherService/Push` over the Connect protocol are declared here;
+// the service itself is driven by hand-rolled HTTP, so it is omitted.
+//
+// LabelPair is inlined into this file with the same field numbers as
+// types.v1.LabelPair, which is all that matters for wire compatibility.
+
+syntax = "proto3";
+
+package push.v1;
+
+message PushRequest {
+  repeated RawProfileSeries series = 1;
+}
+
+// PushResponse is intentionally omitted: the Connect unary response body is
+// ignored (only the HTTP status is checked), so no decode type is needed.
+
+message RawProfileSeries {
+  repeated LabelPair labels = 1;
+  repeated RawSample samples = 2;
+}
+
+message RawSample {
+  // Gzip-compressed pprof profile bytes.
+  bytes raw_profile = 1;
+  // Optional client-assigned profile ID (UUID).
+  string ID = 2;
+}
+
+message LabelPair {
+  string name = 1;
+  string value = 2;
+}

@@ -11,3 +11,11 @@
 - memory-mapped IO
 - identifying / separating IO that hits page cache
 - reconstruct IO traces?
+
+## Profiling
+
+- Instrument futex to create mutex profiles?
+
+## Metrics
+
+- Metrics for performance counters

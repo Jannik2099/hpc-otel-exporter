@@ -15,17 +15,34 @@ services:
     volumes:
       - ./docker/pyroscope/pyroscope.yaml:/etc/pyroscope/pyroscope.yaml:ro
 
+  tempo:
+    image: docker.io/grafana/tempo:latest
+    command:
+      - -config.file=/etc/tempo/tempo.yaml
+    volumes:
+      - ./docker/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+
+  loki:
+    image: docker.io/grafana/loki:latest
+    command:
+      - -config.file=/etc/loki/loki.yaml
+    volumes:
+      - ./docker/loki/loki.yaml:/etc/loki/loki.yaml:ro
+
   grafana:
     image: docker.io/grafana/grafana:latest
     depends_on:
       - mimir
       - pyroscope
+      - tempo
+      - loki
     ports:
       - "3000:3000"
     environment:
       GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_BASIC_ENABLED: "false"
+      GF_PLUGINS_PREINSTALL_SYNC: grafana-llm-app # Profiles Drilldown tries to look for this
     volumes:
       - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
 
@@ -33,6 +50,8 @@ services:
     image: docker.io/grafana/alloy:latest
     depends_on:
       - mimir
+      - tempo
+      - loki
     command:
       - run
       - /etc/alloy/config.alloy

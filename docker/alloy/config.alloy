@@ -9,11 +9,28 @@ otelcol.receiver.otlp "ingest" {
 
 	output {
 		metrics = [otelcol.exporter.otlphttp.mimir.input]
+		traces  = [otelcol.exporter.otlp.tempo.input]
+		logs    = [otelcol.exporter.otlphttp.loki.input]
 	}
 }
 
 otelcol.exporter.otlphttp "mimir" {
 	client {
 		endpoint = "http://mimir:9009/otlp"
+	}
+}
+
+otelcol.exporter.otlp "tempo" {
+	client {
+		endpoint = "tempo:4317"
+		tls {
+			insecure = true
+		}
+	}
+}
+
+otelcol.exporter.otlphttp "loki" {
+	client {
+		endpoint = "http://loki:3100/otlp"
 	}
 }

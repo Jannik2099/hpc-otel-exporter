@@ -1,11 +1,9 @@
 #pragma once
 
-#ifndef __BPF__
-#include <stdbool.h>
-#include <stdint.h>
-#else
-#include "vmlinux.h" // IWYU pragma: keep
-#endif
+#include "prelude.h"
+
+// Types shared between the IO-tracing BPF program (src/bpf/io.bpf.c) and the
+// userspace IO metrics (src/metrics/io.rs, via bindgen -> crate::bindings).
 
 // taken from man statfs.2
 enum FsMagic : uint64_t {
