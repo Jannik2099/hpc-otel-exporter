@@ -1,3 +1,9 @@
+//! Optional self-profiling: runs the `pyroscope` crate's in-process SIGPROF
+//! sampler so the exporter's *own* CPU usage is profiled and pushed to Pyroscope.
+//! This is unrelated to [`crate::profiling`], which profiles the *target* HPC
+//! jobs; this only exists to debug the exporter itself, behind the `pyroscope`
+//! Cargo feature.
+
 use anyhow::Result;
 use pyroscope::backend::{BackendConfig, PprofConfig, pprof_backend};
 use pyroscope::pyroscope::{PyroscopeAgent, PyroscopeAgentBuilder, PyroscopeAgentRunning};

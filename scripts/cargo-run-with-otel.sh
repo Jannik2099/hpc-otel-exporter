@@ -9,6 +9,11 @@ fi
 BIN="$1"
 shift
 
+# Test binaries live in target/.../deps/; skip OTel wrapper for them.
+if [[ "$BIN" == */deps/* ]]; then
+  exec "$BIN" "$@"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 COMPOSE_FILE="$REPO_ROOT/docker-compose.yml"
@@ -20,10 +25,12 @@ fi
 
 podman compose -f "$COMPOSE_FILE" up -d
 
-exec sudo env \
-  OTEL_SERVICE_NAME=hpc-otel-exporter \
-  OTEL_METRICS_EXPORTER=otlp \
-  OTEL_EXPORTER_OTLP_PROTOCOL=grpc \
-  OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 \
-  OTEL_METRIC_EXPORT_INTERVAL=5000 \
+exec sudo systemd-run --scope \
+  -E OTEL_SERVICE_NAME=hpc-otel-exporter \
+  -E OTEL_METRICS_EXPORTER=otlp \
+  -E OTEL_TRACES_EXPORTER=otlp \
+  -E OTEL_LOGS_EXPORTER=otlp \
+  -E OTEL_EXPORTER_OTLP_PROTOCOL=grpc \
+  -E OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 \
+  -E OTEL_METRIC_EXPORT_INTERVAL=5000 \
   "$BIN" "$@"

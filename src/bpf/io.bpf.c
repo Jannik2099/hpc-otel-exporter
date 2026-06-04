@@ -1,19 +1,14 @@
-#pragma once
+// IO tracing: records the size and duration of synchronous vfs_read/vfs_write,
+// grouped by cgroup, into the EVENTS ring buffer.
 
-#include "common_shared.h"
+#include "io.h"
 
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
 
-#define MAX(a, b)                                                              \
-    ({                                                                         \
-        typeof(a) _a = (a);                                                    \
-        typeof(b) _b = (b);                                                    \
-        _a > _b ? _a : _b;                                                     \
-    })
-
-char LICENSE[] SEC("license") = "GPL";
-
+// Per-task start timestamp of the in-flight read/write, stashed at entry and
+// consumed at exit to compute the operation's duration.
 struct {
     __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
     __uint(map_flags, BPF_F_NO_PREALLOC);
@@ -21,6 +16,7 @@ struct {
     __type(value, u64);
 } TASK_STORAGE SEC(".maps");
 
+// Completed IO operations (struct IOEvent), drained by userspace IO metrics.
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 1 << 22); // 4 MiB
@@ -115,4 +111,32 @@ static __always_inline void record_end(const struct file *file, const s64 bytes,
     bpf_ringbuf_submit(event, 0);
 
     return;
+}
+
+SEC("fentry/vfs_read")
+int BPF_PROG(record_vfs_read_entry, const struct file *file, char * /*buf*/,
+             const u64 /*count*/, loff_t * /*pos*/) {
+    record_start(file);
+    return 0;
+}
+
+SEC("fentry/vfs_write")
+int BPF_PROG(record_vfs_write_entry, const struct file *file, char * /*buf*/,
+             const u64 /*count*/, loff_t * /*pos*/) {
+    record_start(file);
+    return 0;
+}
+
+SEC("fexit/vfs_read")
+int BPF_PROG(record_vfs_read_exit, const struct file *file, char * /*buf*/,
+             const u64 /*count*/, loff_t * /*pos*/, const s64 ret) {
+    record_end(file, ret, false);
+    return 0;
+}
+
+SEC("fexit/vfs_write")
+int BPF_PROG(record_vfs_write_exit, const struct file *file, char * /*buf*/,
+             const u64 /*count*/, loff_t * /*pos*/, const s64 ret) {
+    record_end(file, ret, true);
+    return 0;
 }
