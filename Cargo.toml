@@ -40,7 +40,10 @@ blazesym = { version = "0.2.4", features = [
     "tracing",
 ], git = "https://github.com/libbpf/blazesym.git", rev = "d120cd5dd7ef99db6f7ca8dea4c4ed25f650b640" }
 prost = "0.14.3"
-reqwest = { version = "0.13", default-features = false }
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "gzip",
+] }
 flate2 = "1"
 uuid = { version = "1", features = ["v7"] }
 lru = "0.18.0"

@@ -18,8 +18,11 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use blazesym::Pid;
+use blazesym::helper::{ElfResolver, read_elf_build_id};
 use blazesym::symbolize::source::{Process, Source};
-use blazesym::symbolize::{CodeInfo, Input, Symbolized, Symbolizer};
+use blazesym::symbolize::{
+    CodeInfo, Input, ProcessMemberInfo, ProcessMemberType, Resolve, Symbolized, Symbolizer,
+};
 use dashmap::DashMap;
 use log::debug;
 use lru::LruCache;
@@ -30,6 +33,7 @@ use rustc_hash::FxBuildHasher;
 use crate::cgroup::CgroupMeter;
 use crate::telemetry::record_span_error;
 
+use super::debuginfod::DebuginfodClient;
 use super::perf_event::num_configured_cpus;
 use super::proc_maps;
 
@@ -155,13 +159,80 @@ impl ProfilingMetrics {
 /// One is built per symbolization worker per drain (the type is neither `Send`
 /// nor `Sync`, so it can't be cached or shared) and dropped when the worker
 /// finishes, so its open fds never outlive a single drain.
-fn build_symbolizer() -> Symbolizer {
-    Symbolizer::builder()
+///
+/// When a [`DebuginfodClient`] is configured, a process-member dispatcher is
+/// installed so each file-backed mapping is symbolized against debuginfod-fetched
+/// debug info where available, falling back to blazesym's default resolver (local
+/// debug info, then symtab) otherwise — see [`dispatch_debuginfod`].
+fn build_symbolizer(debuginfod: Option<Arc<DebuginfodClient>>) -> Symbolizer {
+    let builder = Symbolizer::builder()
         .enable_auto_reload(true)
         .enable_code_info(true)
         .enable_demangling(true)
-        .enable_inlined_fns(true)
-        .build()
+        .enable_inlined_fns(true);
+    let builder = match debuginfod {
+        Some(client) => {
+            // blazesym calls the dispatcher synchronously while symbolizing, so
+            // the async fetch is bridged with `Handle::block_on`. This is sound
+            // because `resolve_request` runs the symbolizer on a `spawn_blocking`
+            // thread (not inside an async task), where blocking on the runtime is
+            // allowed. Captured once here so every dispatch reuses it.
+            let handle = tokio::runtime::Handle::current();
+            builder.set_process_dispatcher(move |info| dispatch_debuginfod(info, &client, &handle))
+        }
+        None => builder,
+    };
+    builder.build()
+}
+
+/// blazesym process-member dispatcher: for each file-backed mapping, fetch its
+/// split debug info from a debuginfod server (by GNU build ID) and symbolize
+/// against that. Returning `Ok(None)` falls back to blazesym's default resolver,
+/// so a mapping with no build ID, a build ID no server knows, or any single
+/// fetch failure degrades to the existing local-debug-info behavior rather than
+/// failing the whole process' symbolization.
+///
+/// Runs on the worker's `spawn_blocking` thread; the network fetch is driven on
+/// the current tokio runtime via `handle.block_on`.
+fn dispatch_debuginfod(
+    info: ProcessMemberInfo<'_>,
+    client: &DebuginfodClient,
+    handle: &tokio::runtime::Handle,
+) -> Result<Option<Box<dyn Resolve>>, blazesym::Error> {
+    // Only file-backed mappings have an on-disk ELF carrying a build ID; [vdso],
+    // JIT, and other anonymous members have nothing to fetch.
+    let ProcessMemberType::Path(entry) = info.member_entry else {
+        return Ok(None);
+    };
+
+    // Read the build ID from the target's *own* copy of the binary (maps_file is
+    // a `/proc/<pid>/map_files/` path, so it resolves inside the target's mount
+    // namespace and survives unlinked files).
+    let Some(build_id) = read_elf_build_id(&entry.maps_file)? else {
+        // No GNU build ID (e.g. Rust/Go binaries): nothing to look up.
+        return Ok(None);
+    };
+
+    let path = match handle.block_on(client.fetch_debug_info(&build_id)) {
+        Ok(Some(path)) => path,
+        // No server had it: let the default resolver try local debug info.
+        Ok(None) => return Ok(None),
+        // A fetch error must not abort symbolization of the whole process.
+        Err(e) => {
+            debug!("debuginfod fetch failed: {e:#}");
+            return Ok(None);
+        }
+    };
+
+    // A corrupt/unreadable fetched file likewise degrades to the default
+    // resolver rather than failing the mapping.
+    match ElfResolver::open(&path) {
+        Ok(resolver) => Ok(Some(Box::new(resolver))),
+        Err(e) => {
+            debug!("failed to open fetched debug info {}: {e}", path.display());
+            Ok(None)
+        }
+    }
 }
 
 /// The address blazesym is queried at for stack slot `i`. The leaf (`i == 0`) is
@@ -305,6 +376,7 @@ pub(crate) struct SymResult {
 pub(crate) async fn resolve_parallel(
     requests: Vec<SymRequest>,
     interner: &Arc<StringInterner>,
+    debuginfod: Option<&Arc<DebuginfodClient>>,
 ) -> Vec<SymResult> {
     if requests.is_empty() {
         return Vec::new();
@@ -314,14 +386,17 @@ pub(crate) async fn resolve_parallel(
     for req in requests {
         // Acquire before spawning so at most `parallelism` symbolizers parse at
         // once; the permit rides into the task and frees its slot on completion.
+        // A debuginfod fetch blocks its worker (and so holds a permit) only until
+        // the file is cached the first time; later drains hit the on-disk cache.
         let permit = Arc::clone(&sem)
             .acquire_owned()
             .await
             .expect("semaphore is never closed");
         let interner = Arc::clone(interner);
+        let debuginfod = debuginfod.cloned();
         handles.push(tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            resolve_request(req, &interner)
+            resolve_request(req, &interner, debuginfod)
         }));
     }
     let mut results = Vec::with_capacity(handles.len());
@@ -341,7 +416,11 @@ pub(crate) async fn resolve_parallel(
 /// cache plus any negative-cache ranges it found, for [`CgroupCache::apply`] to
 /// fold in. Mirrors the old in-place resolver's batch/`InvalidData`/`NotFound`
 /// handling, writing into the owned [`SymResult`] instead of a borrowed cache.
-fn resolve_request(req: SymRequest, interner: &StringInterner) -> SymResult {
+fn resolve_request(
+    req: SymRequest,
+    interner: &StringInterner,
+    debuginfod: Option<Arc<DebuginfodClient>>,
+) -> SymResult {
     let SymRequest {
         cgroup_id,
         tgid,
@@ -357,7 +436,7 @@ fn resolve_request(req: SymRequest, interner: &StringInterner) -> SymResult {
         symbolize_invocations: 0,
     };
 
-    let symbolizer = build_symbolizer();
+    let symbolizer = build_symbolizer(debuginfod);
     let mut process = Process::new(Pid::from(tgid));
     // Harden against untrusted targets: ignore attacker-writable JIT maps.
     process.perf_map = false;

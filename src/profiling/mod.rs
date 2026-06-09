@@ -25,6 +25,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::bindings::StackKey;
 use crate::cgroup::{CgroupRegistry, PerCgroup};
 
+mod debuginfod;
 mod perf_event;
 mod pprof;
 mod proc_maps;
@@ -34,6 +35,7 @@ mod symbolize;
 mod unwind;
 mod unwind_loader;
 
+use debuginfod::DebuginfodClient;
 use perf_event::{PerfSampler, attach_perf_samplers};
 use pprof::ProfileBuilder;
 use push::Pusher;
@@ -87,6 +89,10 @@ pub struct Profiler {
     /// caches hold. Shared (behind an `Arc`) with the parallel symbolization
     /// workers, which intern as they build frames.
     interner: Arc<StringInterner>,
+    /// Optional debuginfod client for fetching split debug info the target lacks
+    /// locally, shared (behind an `Arc`) with each parallel symbolization worker.
+    /// `None` when `DEBUGINFOD_URLS` is unset, i.e. the operator hasn't opted in.
+    debuginfod: Option<Arc<DebuginfodClient>>,
     /// Userspace half of the native unwinder: keeps the kernel's per-executable
     /// `.eh_frame` tables loaded for the processes being sampled.
     loader: UnwindLoader,
@@ -112,6 +118,19 @@ impl Profiler {
         interval_secs: u64,
         registry: Arc<CgroupRegistry>,
     ) -> Self {
+        // Opt-in via the standard debuginfod environment; a misconfiguration is
+        // logged and treated as "disabled" rather than failing profiler startup.
+        let debuginfod = match DebuginfodClient::discover() {
+            Ok(Some(client)) => {
+                log::info!("debuginfod symbolization enabled (servers: {:?})", client.urls());
+                Some(Arc::new(client))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                log::warn!("debuginfod disabled: {e:#}");
+                None
+            }
+        };
         Self {
             pusher: Pusher::new(base_url, hostname),
             period_ns: (1_000_000_000 / freq.max(1)) as i64,
@@ -119,6 +138,7 @@ impl Profiler {
             cgroups: PerCgroup::new(Arc::clone(&registry)),
             bad_ranges_cleared: Instant::now(),
             interner: Arc::new(StringInterner::default()),
+            debuginfod,
             loader: UnwindLoader::new(registry),
             pending_misses: Arc::new(Mutex::new(FxHashMap::default())),
             sampler: None,
@@ -223,7 +243,7 @@ impl Profiler {
         // Step 2: build the symbolization queue (reads caches), step 3: resolve
         // it in parallel (touches no shared state), step 4: fold results back in.
         let requests = self.build_requests(&by_cgroup);
-        let results = resolve_parallel(requests, &self.interner).await;
+        let results = resolve_parallel(requests, &self.interner, self.debuginfod.as_ref()).await;
         for res in results {
             if let Some(mut cg) = self.cgroups.get_mut(res.cgroup_id) {
                 cg.apply(res);
