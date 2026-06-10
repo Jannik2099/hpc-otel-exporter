@@ -789,10 +789,6 @@ name = "gimli"
 version = "0.32.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
-dependencies = [
- "fallible-iterator",
- "stable_deref_trait",
-]
 
 [[package]]
 name = "gimli"
@@ -885,7 +881,7 @@ dependencies = [
  "dashmap",
  "env_logger",
  "flate2",
- "gimli 0.32.3",
+ "gimli 0.33.0",
  "libbpf-cargo",
  "libbpf-rs",
  "libbpf-sys",
