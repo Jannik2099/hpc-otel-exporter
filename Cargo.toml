@@ -40,7 +40,7 @@ blazesym = { version = "0.2.4", features = [
     "xz",
     "zstd",
     "tracing",
-], git = "https://github.com/libbpf/blazesym.git", rev = "d120cd5dd7ef99db6f7ca8dea4c4ed25f650b640" }
+], git = "https://github.com/libbpf/blazesym.git", rev = "13f5dcc7a9b653f0e50d017f6acfaca7151170f1" }
 prost = "0.14.3"
 reqwest = { version = "0.13", default-features = false, features = [
     "rustls",

@@ -231,7 +231,7 @@ checksum = "84d7ced0ae9557296835c32bf1b1e02b44c746701f898460fb000d7eaa84f00a"
 [[package]]
 name = "blazesym"
 version = "0.2.4"
-source = "git+https://github.com/libbpf/blazesym.git?rev=d120cd5dd7ef99db6f7ca8dea4c4ed25f650b640#d120cd5dd7ef99db6f7ca8dea4c4ed25f650b640"
+source = "git+https://github.com/libbpf/blazesym.git?rev=13f5dcc7a9b653f0e50d017f6acfaca7151170f1#13f5dcc7a9b653f0e50d017f6acfaca7151170f1"
 dependencies = [
  "cpp_demangle",
  "crc32fast",
