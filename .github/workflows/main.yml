@@ -78,6 +78,8 @@ jobs:
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - run: sudo apt-get update
+
       - uses: systemd/mkosi@84af20892b61c8e177e391f997ded8b4cb5514f2 # v26
 
       - name: Setup systemd-machined
