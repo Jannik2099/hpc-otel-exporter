@@ -17,7 +17,9 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "metrics",
     "trace",
     "logs",
+    "internal-logs",
     "grpc-tonic",
+    "zstd-tonic",
     "tls-roots",
 ] }
 opentelemetry_sdk = { version = "0.32", features = [
