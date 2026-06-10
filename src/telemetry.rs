@@ -8,7 +8,9 @@ use std::ffi::CStr;
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider;
 use opentelemetry_appender_log::OpenTelemetryLogBridge;
-use opentelemetry_otlp::{LogExporter, Protocol, SpanExporter, WithExportConfig};
+use opentelemetry_otlp::{
+    Compression, LogExporter, Protocol, SpanExporter, WithExportConfig, WithTonicConfig,
+};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::{SdkLogger, SdkLoggerProvider};
 use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -58,6 +60,7 @@ pub fn init_tracing() -> TracingGuard {
     let exporter = SpanExporter::builder()
         .with_tonic()
         .with_protocol(Protocol::Grpc)
+        .with_compression(Compression::Zstd)
         .build()
         .expect("failed to create OTLP span exporter");
 
@@ -147,6 +150,7 @@ pub fn init_logging(env: env_logger::Env<'_>) -> LoggingGuard {
     let exporter = LogExporter::builder()
         .with_tonic()
         .with_protocol(Protocol::Grpc)
+        .with_compression(Compression::Zstd)
         .build()
         .expect("failed to create OTLP log exporter");
 

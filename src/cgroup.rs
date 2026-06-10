@@ -26,7 +26,9 @@ use std::time::Duration;
 use dashmap::DashMap;
 use dashmap::mapref::one::{Ref, RefMut};
 use opentelemetry::metrics::{Meter, MeterProvider};
-use opentelemetry_otlp::{MetricExporter, Protocol, WithExportConfig};
+use opentelemetry_otlp::{
+    Compression, MetricExporter, Protocol, WithExportConfig, WithTonicConfig,
+};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::metrics::data::ResourceMetrics;
@@ -134,6 +136,7 @@ impl CgroupRegistry {
         let exporter = MetricExporter::builder()
             .with_tonic()
             .with_protocol(Protocol::Grpc)
+            .with_compression(Compression::Zstd)
             .build()
             .expect("failed to create OTLP metric exporter");
 
