@@ -62,6 +62,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 mimalloc = { version = "0.1.52", optional = true }
 
+[patch.crates-io]
+gimli = { git = "https://github.com/Jannik2099/gimli.git", rev = "da55014d4d616ffe438f8abf834e9b0c8fcf8a44" }
+
 [features]
 default = ["mimalloc"]
 
