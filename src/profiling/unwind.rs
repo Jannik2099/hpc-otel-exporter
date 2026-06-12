@@ -227,7 +227,8 @@ fn build_from_object(obj: &object::File) -> Result<(u32, Vec<UnwindRow>)> {
             let converted = classify_row(
                 row.start_address(),
                 row.cfa(),
-                &row.register(Register(DW_REG_RBP)).unwrap_or(RegisterRule::Undefined),
+                &row.register(Register(DW_REG_RBP))
+                    .unwrap_or(RegisterRule::Undefined),
                 &row.register(ra_reg).unwrap_or(RegisterRule::Undefined),
             );
             // Collapse a row whose rule set matches the one already in effect

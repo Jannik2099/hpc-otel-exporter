@@ -1,5 +1,9 @@
 use libbpf_cargo::SkeletonBuilder;
-use std::{env, fs, path::PathBuf, process::Command};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 const SRC: &str = "src/bpf/exporter.bpf.c";
 /// Bindgen entry point: aggregates every per-feature shared-type header so all
@@ -160,7 +164,7 @@ fn generate_compile_commands(extra_clang_args: &Vec<&str>) {
     );
 }
 
-fn generate_bindings(bpf_headers_dir: &PathBuf, out_dir: &PathBuf) {
+fn generate_bindings(bpf_headers_dir: &Path, out_dir: &Path) {
     let project_root = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
     let header_path = PathBuf::from(&project_root).join(SHARED_HEADER);
     let bindings_path = out_dir.join("bindings.rs");

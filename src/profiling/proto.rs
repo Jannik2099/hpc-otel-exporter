@@ -4,10 +4,12 @@
 
 /// Generated from `profile.proto` (pprof, package `google.v1`).
 pub mod pprof {
+    #![allow(warnings)]
     include!(concat!(env!("OUT_DIR"), "/google.v1.rs"));
 }
 
 /// Generated from `pyroscope_push.proto` (Pyroscope push API, package `push.v1`).
 pub mod push {
+    #![allow(warnings)]
     include!(concat!(env!("OUT_DIR"), "/push.v1.rs"));
 }

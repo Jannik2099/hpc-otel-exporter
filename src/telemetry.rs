@@ -24,7 +24,7 @@ pub(crate) fn hostname() -> String {
     let mut buf = [0u8; 4096];
     let _ = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
     CStr::from_bytes_until_nul(&buf)
-        .unwrap_or_else(|_| CStr::from_bytes_with_nul(b"unknown\0").unwrap())
+        .unwrap_or(c"unknown")
         .to_str()
         .unwrap_or("unknown")
         .to_owned()

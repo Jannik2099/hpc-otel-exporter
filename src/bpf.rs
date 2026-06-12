@@ -3,7 +3,11 @@
 
 use log::debug;
 
-include!(concat!(env!("OUT_DIR"), "/exporter.skel.rs"));
+#[allow(warnings)]
+mod skel {
+    include!(concat!(env!("OUT_DIR"), "/exporter.skel.rs"));
+}
+pub use skel::*;
 
 /// Bump the memlock rlimit to infinity. Needed for older kernels that don't use
 /// the new memcg-based BPF memory accounting, see

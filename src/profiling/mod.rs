@@ -122,7 +122,10 @@ impl Profiler {
         // logged and treated as "disabled" rather than failing profiler startup.
         let debuginfod = match DebuginfodClient::discover() {
             Ok(Some(client)) => {
-                log::info!("debuginfod symbolization enabled (servers: {:?})", client.urls());
+                log::info!(
+                    "debuginfod symbolization enabled (servers: {:?})",
+                    client.urls()
+                );
                 Some(Arc::new(client))
             }
             Ok(None) => None,

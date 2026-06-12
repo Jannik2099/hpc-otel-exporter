@@ -332,8 +332,10 @@ impl UnwindLoader {
 
             // Always publish the mapping set, even when empty, so a process with
             // no unwindable code stops being re-reported as a miss on every sample.
-            let mut pm = ProcessMappings::default();
-            pm.len = entries.len() as u32;
+            let mut pm = ProcessMappings {
+                len: entries.len() as u32,
+                ..Default::default()
+            };
             pm.entries[..entries.len()].copy_from_slice(&entries);
             if let Err(e) = procs.update(&pid.to_ne_bytes(), as_bytes(&pm), MapFlags::ANY) {
                 warn!("failed to write PROC_MAPPINGS for pid {pid}: {e}");
