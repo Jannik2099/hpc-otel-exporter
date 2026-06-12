@@ -10,12 +10,7 @@ use libbpf_rs::{Link, ProgramMut};
 use log::debug;
 
 mod perf {
-    #![allow(non_upper_case_globals)]
-    #![allow(non_camel_case_types)]
-    #![allow(clippy::upper_case_acronyms)]
-    #![allow(non_snake_case)]
-    #![allow(dead_code)]
-    #![allow(unsafe_op_in_unsafe_fn)]
+    #![allow(warnings)]
     include!(concat!(env!("OUT_DIR"), "/perf_event_bindings.rs"));
 }
 
@@ -54,13 +49,17 @@ const _: () = assert!(std::mem::size_of::<PerfEventAttr>() == 64);
 
 /// Open a CPU-cycles perf event sampling at `freq` Hz on `cpu`, across all
 /// processes. Requires `CAP_PERFMON`/root (which we already have for eBPF).
-fn perf_event_open(freq: u64, cpu: i32) -> std::io::Result<OwnedFd> {
+fn perf_event_open(freq: u64, cpu: i32, exclude_kernel: bool) -> std::io::Result<OwnedFd> {
+    let mut flags = PERF_ATTR_FLAG_FREQ;
+    if exclude_kernel {
+        flags |= PERF_ATTR_FLAG_EXCLUDE_KERNEL;
+    }
     let attr = PerfEventAttr {
         type_: perf::perf_type_id_PERF_TYPE_SOFTWARE,
         size: std::mem::size_of::<PerfEventAttr>() as u32,
         config: perf::perf_sw_ids_PERF_COUNT_SW_CPU_CLOCK as u64,
         sample_freq: freq,
-        flags: PERF_ATTR_FLAG_FREQ | PERF_ATTR_FLAG_EXCLUDE_KERNEL,
+        flags,
         ..Default::default()
     };
 
@@ -96,7 +95,7 @@ pub(crate) fn attach_perf_samplers(prog: &ProgramMut, freq: u64) -> Result<PerfS
     let mut links = Vec::new();
 
     for cpu in 0..n_cpus {
-        match perf_event_open(freq, cpu) {
+        match perf_event_open(freq, cpu, true) {
             Ok(fd) => {
                 let link = prog
                     .attach_perf_event(fd.as_raw_fd())
