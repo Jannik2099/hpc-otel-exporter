@@ -93,6 +93,9 @@ enum FsMagic : uint64_t {
     XENIX_SUPER_MAGIC = 0x012ff7b4,
     XFS_SUPER_MAGIC = 0x58465342,
     _XIAFS_SUPER_MAGIC = 0x012fd16d, /* Linux 2.0 and earlier */
+    // third party filesystems
+    GPFS_MAGIC = 0x47504653,
+    LUSTRE_MAGIC = 0x0BD00BD0,
 };
 
 struct TimeInfo {
