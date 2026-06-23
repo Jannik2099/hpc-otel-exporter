@@ -137,6 +137,7 @@ impl CgroupRegistry {
             .with_tonic()
             .with_protocol(Protocol::Grpc)
             .with_compression(Compression::Zstd)
+            .with_tls_config(crate::telemetry::otlp_tls_config())
             .build()
             .expect("failed to create OTLP metric exporter");
 
