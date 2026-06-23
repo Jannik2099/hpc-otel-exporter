@@ -27,10 +27,5 @@ async fn main() -> Result<()> {
     let env_logger = env_logger::Env::default().filter_or("RUST_LOG", "debug");
     let _logging_guard = telemetry::init_logging(env_logger);
 
-    // Optional self-profiling of the exporter itself (separate from the target
-    // profiling in `profiling`); kept alive for the process' lifetime.
-    #[cfg(feature = "pyroscope")]
-    let _pyroscope_agent = self_profile::setup_pyroscope();
-
     app::run(args).await
 }

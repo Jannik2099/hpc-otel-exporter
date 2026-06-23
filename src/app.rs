@@ -58,6 +58,11 @@ pub struct Args {
 /// event loop until Ctrl-C. The logging guard is owned by the caller; the tracing
 /// provider is installed here and lives for the whole run.
 pub async fn run(args: Args) -> Result<()> {
+    // Optional self-profiling of the exporter itself (separate from the target
+    // profiling in `profiling`); kept alive for the process' lifetime.
+    #[cfg(feature = "pyroscope")]
+    let _pyroscope_agent = crate::self_profile::setup_pyroscope(&args.pyroscope_url);
+
     // Bump the memlock rlimit before loading (needed on older kernels).
     bpf::bump_memlock_rlimit();
 

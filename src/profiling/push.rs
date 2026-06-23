@@ -20,8 +20,22 @@ pub(crate) struct Pusher {
 
 impl Pusher {
     pub(crate) fn new(base_url: String, hostname: String) -> Self {
+        let pyroscope_token = std::env::var("PYROSCOPE_BEARER_TOKEN").ok();
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Some(pyroscope_token) = pyroscope_token {
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                reqwest::header::HeaderValue::from_str(&format!("Bearer {}", pyroscope_token))
+                    .unwrap(),
+            );
+        }
+
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap();
         Pusher {
-            client: reqwest::Client::new(),
+            client,
             base_url: base_url.trim_end_matches('/').to_owned(),
             hostname,
         }
