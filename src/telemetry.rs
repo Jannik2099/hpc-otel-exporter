@@ -8,6 +8,7 @@ use std::ffi::CStr;
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider;
 use opentelemetry_appender_log::OpenTelemetryLogBridge;
+use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
 use opentelemetry_otlp::{
     Compression, LogExporter, Protocol, SpanExporter, WithExportConfig, WithTonicConfig,
 };
@@ -39,6 +40,13 @@ pub(crate) fn build_resource() -> Resource {
         .build()
 }
 
+/// TLS config for the OTLP/gRPC exporters. opentelemetry-otlp auto-enables TLS for
+/// `https://` endpoints, but only with an *empty* root store unless given an
+/// explicit config. Who the fuck came up with this?
+pub(crate) fn otlp_tls_config() -> ClientTlsConfig {
+    ClientTlsConfig::new().with_enabled_roots()
+}
+
 /// Mark a `tracing` span as failed, setting the OTel `ERROR` status through the
 /// `otel.status_code` / `otel.status_description` fields the
 /// tracing-opentelemetry layer recognises (see its `SpanAttributeVisitor`).
@@ -61,6 +69,7 @@ pub fn init_tracing() -> TracingGuard {
         .with_tonic()
         .with_protocol(Protocol::Grpc)
         .with_compression(Compression::Zstd)
+        .with_tls_config(otlp_tls_config())
         .build()
         .expect("failed to create OTLP span exporter");
 
@@ -151,6 +160,7 @@ pub fn init_logging(env: env_logger::Env<'_>) -> LoggingGuard {
         .with_tonic()
         .with_protocol(Protocol::Grpc)
         .with_compression(Compression::Zstd)
+        .with_tls_config(otlp_tls_config())
         .build()
         .expect("failed to create OTLP log exporter");
 
