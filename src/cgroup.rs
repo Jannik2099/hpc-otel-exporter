@@ -168,6 +168,16 @@ impl CgroupMeter {
 /// [`cleanup_dead_cgroups`]: Self::cleanup_dead_cgroups
 pub struct CgroupRegistry {
     cgroups: DashMap<u64, Arc<CgroupMeter>, FxBuildHasher>,
+    /// Negative cache of cgroup ids that resolved to the root cgroup or could not
+    /// be named (so they carry no meter). Kept so a flood of events from such
+    /// cgroups — the norm on a busy node — is rejected in O(1) instead of redoing
+    /// the resolution work per event. Cleared on every [`cleanup_dead_cgroups`]
+    /// pass so the rejection can never outlive a ~cleanup-interval window: a cgroup
+    /// that was only transiently unresolvable (e.g. its emitting task had already
+    /// exited) gets retried.
+    ///
+    /// [`cleanup_dead_cgroups`]: Self::cleanup_dead_cgroups
+    unresolved: DashMap<u64, (), FxBuildHasher>,
     resource: Resource,
     exporter: SharedExporter,
     /// Per-provider metric views contributed by features (see [`CgroupView`]),
@@ -190,6 +200,7 @@ impl CgroupRegistry {
 
         Self {
             cgroups: DashMap::default(),
+            unresolved: DashMap::default(),
             resource: build_resource(),
             exporter: SharedExporter(Arc::new(exporter)),
             views,
@@ -198,22 +209,65 @@ impl CgroupRegistry {
 
     /// Return the [`CgroupMeter`] for `cgroup_id`, creating its provider on first
     /// use. Returns `None` for the root cgroup (empty name, which Pyroscope and
-    /// most dashboards reject anyway) or a cgroup that vanished before its name
-    /// could be resolved.
-    pub async fn get_or_create(&self, cgroup_id: u64) -> Option<Arc<CgroupMeter>> {
+    /// most dashboards reject anyway) or a cgroup that could not be named.
+    ///
+    /// `tgid` is an optional resolution hint: the id of a task that was running in
+    /// the cgroup when the event was produced. When given, the name is read
+    /// straight from `/proc/<tgid>/cgroup` (one small file) instead of walking all
+    /// of `/sys/fs/cgroup` looking for the matching inode — the walk is O(number of
+    /// cgroups on the machine) and, on a busy node (especially a hybrid
+    /// cgroup v1+v2 layout, where the walk also traverses every v1 controller tree
+    /// whose inodes never match the v2 id), dominates the event-processing cost.
+    /// Callers without a task in hand (e.g. profile draining) pass `None` and fall
+    /// back to the walk.
+    pub async fn get_or_create(
+        &self,
+        cgroup_id: u64,
+        tgid: Option<u32>,
+    ) -> Option<Arc<CgroupMeter>> {
         if let Some(cg) = self.cgroups.get(&cgroup_id) {
             return Some(Arc::clone(&cg));
         }
-        let name = resolve_cgroup_name(cgroup_id).await?;
-        if name.is_empty() {
+        if self.unresolved.contains_key(&cgroup_id) {
             return None;
         }
-        Some(Arc::clone(
-            &self
-                .cgroups
-                .entry(cgroup_id)
-                .or_insert_with(|| Arc::new(self.create_meter(name))),
-        ))
+
+        match self.resolve_name(cgroup_id, tgid).await {
+            // A real, nameable cgroup: create (or pick up the racing create of) its
+            // provider.
+            Resolution::Named(name) => Some(Arc::clone(
+                &self
+                    .cgroups
+                    .entry(cgroup_id)
+                    .or_insert_with(|| Arc::new(self.create_meter(name))),
+            )),
+            // Root or genuinely unnameable: remember it so the next event from the
+            // same id is rejected without redoing the work (until the next cleanup
+            // clears the negative cache).
+            Resolution::Unnameable => {
+                self.unresolved.insert(cgroup_id, ());
+                None
+            }
+            // Could only fail to confirm via `/proc` (the hinting task has since
+            // exited, or migrated cgroups). The id itself may well be live, so don't
+            // poison the negative cache — just skip this event and let the next one,
+            // hopefully from a resident task, resolve it.
+            Resolution::Unconfirmed => None,
+        }
+    }
+
+    /// Resolve `cgroup_id` to a name, preferring the cheap `/proc/<tgid>/cgroup`
+    /// path when a `tgid` hint is available and only walking `/sys/fs/cgroup` as a
+    /// fallback (no hint, e.g. the profiler).
+    async fn resolve_name(&self, cgroup_id: u64, tgid: Option<u32>) -> Resolution {
+        if let Some(tgid) = tgid {
+            return resolve_cgroup_name_via_proc(cgroup_id, tgid).await;
+        }
+        match resolve_cgroup_name(cgroup_id).await {
+            Some(name) if !name.is_empty() => Resolution::Named(name),
+            // No name (root) or no matching inode in the tree (dead): cacheable.
+            _ => Resolution::Unnameable,
+        }
     }
 
     /// Walk `/sys/fs/cgroup`, shut down + drop providers whose cgroup no longer
@@ -221,6 +275,12 @@ impl CgroupRegistry {
     /// their own per-cgroup state against the same snapshot.
     pub async fn cleanup_dead_cgroups(&self) -> FxHashSet<u64> {
         let live = collect_live_cgroup_ids().await;
+
+        // Drop the negative cache so a cgroup that was only transiently
+        // unresolvable last window (its emitting task had already exited) gets a
+        // fresh resolution attempt rather than staying suppressed.
+        self.unresolved.clear();
+
         let dead: Vec<u64> = self
             .cgroups
             .iter()
@@ -362,7 +422,15 @@ impl<T> PerCgroup<T> {
     /// meter via `init` on first sight. Returns `None` for the root cgroup or one
     /// that vanished before its name could be resolved (no meter), so callers can
     /// drop work for cgroups that have no metrics destination.
-    pub async fn get_or_create<F>(&self, id: u64, init: F) -> Option<RefMut<'_, u64, T>>
+    ///
+    /// `tgid` is the [resolution hint](CgroupRegistry::get_or_create) forwarded to
+    /// the registry: pass the id of the task the event came from when known.
+    pub async fn get_or_create<F>(
+        &self,
+        id: u64,
+        tgid: Option<u32>,
+        init: F,
+    ) -> Option<RefMut<'_, u64, T>>
     where
         F: FnOnce(&Arc<CgroupMeter>) -> T,
     {
@@ -370,7 +438,7 @@ impl<T> PerCgroup<T> {
             return Some(existing);
         }
         // Miss: the get_mut guard above is dropped before this await.
-        let meter = self.registry.get_or_create(id).await?;
+        let meter = self.registry.get_or_create(id, tgid).await?;
         Some(self.map.entry(id).or_insert_with(|| init(&meter)))
     }
 
@@ -401,6 +469,92 @@ impl<T> PerCgroup<T> {
     /// workload exits.
     pub fn retain_live(&self, live: &FxHashSet<u64>) {
         self.map.retain(|id, _| live.contains(id));
+    }
+}
+
+/// Outcome of resolving a cgroup id to a name, distinguishing the cacheable
+/// "this id has no usable name" verdict from the "couldn't confirm right now"
+/// one, which must not be cached (see [`CgroupRegistry::get_or_create`]).
+enum Resolution {
+    /// A real cgroup with a non-empty name.
+    Named(String),
+    /// The root cgroup, or an id with no matching cgroup at all. Cacheable.
+    Unnameable,
+    /// Resolution via `/proc` could not be confirmed (the hinting task exited or
+    /// migrated). Not cacheable — the id may still be live.
+    Unconfirmed,
+}
+
+/// The cgroup v2 (unified) mount point, as reported by `/proc/self/mountinfo`,
+/// resolved once and cached. Defaults to `/sys/fs/cgroup` if no `cgroup2` mount is
+/// found. On a hybrid layout this is typically `/sys/fs/cgroup/unified`.
+fn cgroup2_mount_point() -> &'static Path {
+    use std::sync::OnceLock;
+    static MOUNT: OnceLock<PathBuf> = OnceLock::new();
+    MOUNT.get_or_init(|| detect_cgroup2_mount().unwrap_or_else(|| PathBuf::from("/sys/fs/cgroup")))
+}
+
+fn detect_cgroup2_mount() -> Option<PathBuf> {
+    parse_cgroup2_mount(&std::fs::read_to_string("/proc/self/mountinfo").ok()?)
+}
+
+fn parse_cgroup2_mount(mountinfo: &str) -> Option<PathBuf> {
+    mountinfo.lines().find_map(|line| {
+        // mountinfo: `... root mountpoint opts <optional fields> - fstype source super`.
+        // The fstype sits just past the ` - ` separator; the mount point is the 5th
+        // space-separated field of the part before it.
+        let (pre, post) = line.split_once(" - ")?;
+        (post.split_whitespace().next() == Some("cgroup2"))
+            .then(|| pre.split_whitespace().nth(4).map(PathBuf::from))
+            .flatten()
+    })
+}
+
+/// Resolve a cgroup id to its name using `/proc/<tgid>/cgroup`, avoiding the
+/// full-tree walk in [`resolve_cgroup_name`]. Reads the task's unified-hierarchy
+/// (`0::<path>`) entry, anchors it under the cgroup v2 mount, and confirms the
+/// resulting directory's inode is in fact `cgroup_id` — guarding against the task
+/// having migrated cgroups between the eBPF event and now.
+async fn resolve_cgroup_name_via_proc(cgroup_id: u64, tgid: u32) -> Resolution {
+    use std::os::unix::fs::MetadataExt;
+
+    // The hinting task has exited (or /proc is unreadable): can't confirm.
+    let Ok(content) = tokio::fs::read_to_string(format!("/proc/{tgid}/cgroup")).await else {
+        return Resolution::Unconfirmed;
+    };
+    // The unified-hierarchy line: `0::<path>`. Always present on v2 and hybrid.
+    let Some(rel) = content.lines().find_map(|l| l.strip_prefix("0::")) else {
+        return Resolution::Unconfirmed;
+    };
+
+    let mount = cgroup2_mount_point();
+    // `rel` is absolute ("/system.slice/...", or "/" for the root). Join onto the
+    // mount point without letting the leading slash reset the path.
+    let full = if rel == "/" {
+        mount.to_path_buf()
+    } else {
+        mount.join(rel.trim_start_matches('/'))
+    };
+
+    let Ok(meta) = tokio::fs::metadata(&full).await else {
+        return Resolution::Unconfirmed;
+    };
+    if meta.ino() != cgroup_id {
+        // The task moved cgroups since the event; this path names the wrong one.
+        return Resolution::Unconfirmed;
+    }
+
+    // Name relative to /sys/fs/cgroup, matching the walk-based resolver's output so
+    // both paths produce the same series. Empty for the root cgroup.
+    let name = full
+        .strip_prefix("/sys/fs/cgroup")
+        .unwrap_or(&full)
+        .to_string_lossy()
+        .into_owned();
+    if name.is_empty() {
+        Resolution::Unnameable
+    } else {
+        Resolution::Named(name)
     }
 }
 
@@ -468,4 +622,73 @@ async fn walk_cgroup_dir(dir: &Path) -> FxHashSet<u64> {
     }
 
     ids
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn parse_cgroup2_mount_picks_the_cgroup2_line() {
+        // Hybrid layout: v1 controllers under /sys/fs/cgroup, v2 under /unified.
+        let mountinfo = "\
+25 30 0:23 / /sys/fs/cgroup ro,nosuid,nodev,noexec shared:9 - tmpfs tmpfs ro,mode=755
+26 25 0:24 / /sys/fs/cgroup/unified rw,nosuid,nodev,noexec shared:10 - cgroup2 cgroup2 rw,nsdelegate
+27 25 0:25 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec shared:11 - cgroup cgroup rw,memory
+";
+        assert_eq!(
+            parse_cgroup2_mount(mountinfo),
+            Some(PathBuf::from("/sys/fs/cgroup/unified"))
+        );
+    }
+
+    #[test]
+    fn parse_cgroup2_mount_handles_pure_v2_and_absence() {
+        let unified = "31 25 0:26 / /sys/fs/cgroup rw,nosuid - cgroup2 cgroup2 rw,nsdelegate\n";
+        assert_eq!(
+            parse_cgroup2_mount(unified),
+            Some(PathBuf::from("/sys/fs/cgroup"))
+        );
+
+        let legacy_only = "27 25 0:25 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n";
+        assert_eq!(parse_cgroup2_mount(legacy_only), None);
+    }
+
+    /// On a cgroup v2 host, resolving our own pid's cgroup id via `/proc` must
+    /// agree with the full-tree walk — the two resolvers have to produce identical
+    /// names so they don't split a series. Skips on hosts without a v2 hierarchy.
+    #[tokio::test]
+    async fn proc_resolution_matches_the_tree_walk_for_self() {
+        let pid = std::process::id();
+        // Our own v2 cgroup id is the inode of the dir named by /proc/self/cgroup's
+        // `0::` line under the cgroup2 mount.
+        let Ok(content) = std::fs::read_to_string("/proc/self/cgroup") else {
+            return;
+        };
+        let Some(rel) = content.lines().find_map(|l| l.strip_prefix("0::")) else {
+            return;
+        };
+        let mount = cgroup2_mount_point();
+        let path = if rel == "/" {
+            mount.to_path_buf()
+        } else {
+            mount.join(rel.trim_start_matches('/'))
+        };
+        let Ok(meta) = std::fs::metadata(&path) else {
+            return;
+        };
+        let cgroup_id = meta.ino();
+
+        let via_walk = resolve_cgroup_name(cgroup_id).await;
+        match resolve_cgroup_name_via_proc(cgroup_id, pid).await {
+            // Non-root: both resolvers must agree on the name.
+            Resolution::Named(name) => assert_eq!(Some(name), via_walk),
+            // Root cgroup: the walk yields an empty name (or None).
+            Resolution::Unnameable => {
+                assert!(via_walk.as_deref().unwrap_or("").is_empty());
+            }
+            Resolution::Unconfirmed => panic!("self pid must resolve via /proc"),
+        }
+    }
 }

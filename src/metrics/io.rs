@@ -148,7 +148,7 @@ impl IoMetrics {
 
         let metrics = match self
             .cgroups
-            .get_or_create(event.cgroup_id, |meter| {
+            .get_or_create(event.cgroup_id, Some(event.tgid), |meter| {
                 let duration_histogram = meter
                     .meter
                     .u64_histogram("io.duration")
