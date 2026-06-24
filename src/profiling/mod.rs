@@ -235,7 +235,7 @@ impl Profiler {
         for cgroup_id in cgroup_ids {
             if self
                 .cgroups
-                .get_or_create(cgroup_id, |meter| CgroupCache::new(Arc::clone(meter)))
+                .get_or_create(cgroup_id, None, |meter| CgroupCache::new(Arc::clone(meter)))
                 .await
                 .is_none()
             {

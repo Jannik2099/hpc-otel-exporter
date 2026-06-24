@@ -239,7 +239,7 @@ impl UnwindLoader {
         let cgroup_name = self
             .cgroup_metrics
             .registry()
-            .get_or_create(cgroup_id)
+            .get_or_create(cgroup_id, Some(pid))
             .await
             .map(|m| m.name.clone())
             .unwrap_or_else(|| "unknown".to_owned());
@@ -364,7 +364,7 @@ impl UnwindLoader {
         if let Some((libraries_read, libraries_failed)) = load
             && let Some(metrics) = self
                 .cgroup_metrics
-                .get_or_create(cgroup_id, |meter| UnwindMetrics::new(meter))
+                .get_or_create(cgroup_id, Some(pid), |meter| UnwindMetrics::new(meter))
                 .await
         {
             metrics.process_loads.add(1);
