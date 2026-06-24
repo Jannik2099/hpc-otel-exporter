@@ -52,12 +52,32 @@ pub struct Args {
     /// Disable CPU profiling entirely
     #[arg(long)]
     no_profiling: bool,
+
+    /// Number of threads to use for the tokio runtime (default: number of CPUs)
+    #[arg(long)]
+    num_threads: Option<usize>,
 }
 
 /// Load and attach the eBPF object, wire up the telemetry features, and run the
 /// event loop until Ctrl-C. The logging guard is owned by the caller; the tracing
 /// provider is installed here and lives for the whole run.
-pub async fn run(args: Args) -> Result<()> {
+pub fn run(args: Args) -> Result<()> {
+    let nproc = std::thread::available_parallelism()?.get();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(args.num_threads.unwrap_or(nproc))
+        .enable_all()
+        .build()?;
+
+    runtime.block_on(run_async(args))
+}
+
+async fn run_async(args: Args) -> Result<()> {
+    // Console logging (env_logger) plus OTLP log export via the OpenTelemetry
+    // appender. Installed first so setup-time logs are captured too; the guard
+    // flushes buffered records on exit and must outlive the whole run.
+    let env_logger = env_logger::Env::default().filter_or("RUST_LOG", "debug");
+    let _logging_guard = telemetry::init_logging(env_logger);
+
     // Optional self-profiling of the exporter itself (separate from the target
     // profiling in `profiling`); kept alive for the process' lifetime.
     #[cfg(feature = "pyroscope")]
