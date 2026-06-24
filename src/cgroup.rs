@@ -20,7 +20,7 @@
 //! [views]: opentelemetry_sdk::metrics::View
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -33,8 +33,9 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::metrics::data::ResourceMetrics;
 use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
+use opentelemetry_sdk::metrics::reader::MetricReader;
 use opentelemetry_sdk::metrics::{
-    Instrument, PeriodicReader, SdkMeterProvider, Stream, Temporality,
+    Instrument, InstrumentKind, ManualReader, Pipeline, SdkMeterProvider, Stream, Temporality,
 };
 use rustc_hash::{FxBuildHasher, FxHashSet};
 
@@ -77,6 +78,37 @@ impl PushMetricExporter for SharedExporter {
     }
 }
 
+/// Wraps a [`ManualReader`] in an `Arc` so the per-cgroup provider and the
+/// registry share one reader: the provider drives collection into it, and
+/// [`CgroupRegistry::collect_and_export_all`] reads it out on a single shared
+/// timer.
+///
+/// [`PeriodicReader`]: opentelemetry_sdk::metrics::PeriodicReader
+#[derive(Clone, Debug)]
+struct SharedManualReader(Arc<ManualReader>);
+
+impl MetricReader for SharedManualReader {
+    fn register_pipeline(&self, pipeline: Weak<Pipeline>) {
+        self.0.register_pipeline(pipeline);
+    }
+
+    fn collect(&self, rm: &mut ResourceMetrics) -> OTelSdkResult {
+        self.0.collect(rm)
+    }
+
+    fn force_flush(&self) -> OTelSdkResult {
+        self.0.force_flush()
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        self.0.shutdown_with_timeout(timeout)
+    }
+
+    fn temporality(&self, kind: InstrumentKind) -> Temporality {
+        self.0.temporality(kind)
+    }
+}
+
 /// One cgroup's [`SdkMeterProvider`], shared by every feature that emits metrics
 /// for that cgroup (IO tracing, CPU profiling, …).
 ///
@@ -84,26 +116,36 @@ impl PushMetricExporter for SharedExporter {
 /// are recorded on the instruments instead. A provider is created the first time
 /// any feature touches a cgroup and is shut down + dropped by
 /// [`CgroupRegistry::cleanup_dead_cgroups`] once the cgroup disappears, so stale
-/// series stop being exported. Features build their own instruments from
-/// [`meter`](Self::meter) and hold an `Arc<CgroupMeter>` so the provider keeps
-/// exporting as long as anyone references it.
+/// series stop being exported (the OTel SDK has no API to drop an individual
+/// series, so dropping the whole provider is how a dead cgroup's series are
+/// retired). Features build their own instruments from [`meter`](Self::meter) and
+/// hold an `Arc<CgroupMeter>` so the provider stays alive — and exportable by
+/// [`collect_and_export_all`](CgroupRegistry::collect_and_export_all) — as long as
+/// anyone references it.
 pub struct CgroupMeter {
     pub name: String,
     pub meter: Meter,
     provider: SdkMeterProvider,
+    /// The provider's reader, shared so [`CgroupRegistry::collect_and_export_all`]
+    /// can pull this cgroup's metrics on the registry's single export timer.
+    reader: SharedManualReader,
 }
 
 impl CgroupMeter {
-    /// Build a standalone meter backed by a no-op provider, for tests in other
-    /// modules that need a [`CgroupMeter`] without OTLP plumbing.
+    /// Build a standalone meter backed by an unread [`ManualReader`], for tests
+    /// in other modules that need a [`CgroupMeter`] without OTLP plumbing.
     #[cfg(test)]
     pub(crate) fn for_test(name: &str) -> Arc<Self> {
-        let provider = SdkMeterProvider::builder().build();
+        let reader = SharedManualReader(Arc::new(ManualReader::builder().build()));
+        let provider = SdkMeterProvider::builder()
+            .with_reader(reader.clone())
+            .build();
         let meter = provider.meter("test");
         Arc::new(CgroupMeter {
             name: name.to_owned(),
             meter,
             provider,
+            reader,
         })
     }
 }
@@ -181,35 +223,16 @@ impl CgroupRegistry {
             .filter(|id| !live.contains(id))
             .collect();
 
-        // Drop dead cgroups from the map first (cheap, non-blocking), then shut their
-        // providers down off the async runtime.
-        let dead_meters: Vec<Arc<CgroupMeter>> = dead
-            .into_iter()
-            .filter_map(|id| self.cgroups.remove(&id).map(|(_, cg)| cg))
-            .collect();
-
-        if !dead_meters.is_empty() {
-            // `SdkMeterProvider::shutdown()` blocks the calling thread (up to 5s) while
-            // it signals each `PeriodicReader`'s background thread to do a final export
-            // and exit. That final export is `futures_executor::block_on(exporter.export())`
-            // on the reader's own thread, and it can only make progress while the tokio
-            // runtime is free to drive the shared OTLP/tonic channel. If we ran shutdown
-            // directly on the event-loop worker, we'd starve that export: it would stall,
-            // shutdown would time out, and the (detached) reader thread would be orphaned.
-            // So we run the shutdowns on a blocking thread and await the handle:
-            // that await is the join we cannot do on the SDK's own
-            // detached thread, so we do not return until every dead reader has stopped.
-            if let Err(e) = tokio::task::spawn_blocking(move || {
-                for cg in dead_meters {
-                    log::info!("Removing cgroup {}", cg.name);
-                    if let Err(e) = cg.provider.shutdown() {
-                        log::warn!("Failed to shut down provider for cgroup {}: {e}", cg.name);
-                    }
+        // Drop dead cgroups from the map and shut their providers down. With a
+        // `ManualReader` there is no background thread to join and no final
+        // blocking export — `shutdown()` just marks the reader closed so any later
+        // `collect()` is a no-op — so this is cheap and runs inline.
+        for id in dead {
+            if let Some((_, cg)) = self.cgroups.remove(&id) {
+                log::info!("Removing cgroup {}", cg.name);
+                if let Err(e) = cg.provider.shutdown() {
+                    log::warn!("Failed to shut down provider for cgroup {}: {e}", cg.name);
                 }
-            })
-            .await
-            {
-                log::warn!("Cgroup provider shutdown task failed to join: {e}");
             }
         }
 
@@ -219,11 +242,19 @@ impl CgroupRegistry {
     fn create_meter(&self, name: String) -> CgroupMeter {
         log::info!("Adding cgroup {name}");
 
-        // A fresh PeriodicReader per provider, reusing the shared Grpc exporter.
-        let reader = PeriodicReader::builder(self.exporter.clone()).build();
+        // A thread-free `ManualReader` per provider. The registry's single export
+        // timer (`collect_and_export_all`) pulls it through the shared OTLP
+        // exporter, so — unlike a `PeriodicReader` — no per-cgroup background
+        // thread is spawned. Match the exporter's temporality so collected data is
+        // aggregated the way the collector expects.
+        let reader = SharedManualReader(Arc::new(
+            ManualReader::builder()
+                .with_temporality(self.exporter.temporality())
+                .build(),
+        ));
 
         let mut builder = SdkMeterProvider::builder()
-            .with_reader(reader)
+            .with_reader(reader.clone())
             .with_resource(self.resource.clone());
         // Apply each feature-contributed view (e.g. the IO histogram aggregations).
         for view in &self.views {
@@ -238,6 +269,38 @@ impl CgroupRegistry {
             name,
             meter,
             provider,
+            reader,
+        }
+    }
+
+    /// Collect every live cgroup's [`ManualReader`] and push it through the shared
+    /// OTLP exporter. Driven by a single timer in [`crate::app`], this replaces the
+    /// per-provider background threads a [`PeriodicReader`] would otherwise spawn —
+    /// one export task instead of one OS thread per cgroup.
+    ///
+    /// [`PeriodicReader`]: opentelemetry_sdk::metrics::PeriodicReader
+    pub async fn collect_and_export_all(&self) {
+        // Snapshot the providers so no DashMap guard is held across the `.await`
+        // below (holding one risks deadlocking `get_or_create`; see [`PerCgroup`]).
+        let cgroups: Vec<Arc<CgroupMeter>> =
+            self.cgroups.iter().map(|e| Arc::clone(e.value())).collect();
+
+        for cg in cgroups {
+            let mut rm = ResourceMetrics::default();
+            if let Err(e) = cg.reader.collect(&mut rm) {
+                log::warn!("Failed to collect metrics for cgroup {}: {e}", cg.name);
+                continue;
+            }
+            // Skip a genuinely empty payload — a provider whose instruments have
+            // never recorded a measurement. Under cumulative temporality an active
+            // cgroup keeps re-exporting its running totals even while idle, so this
+            // does not drop data for quiet-but-live cgroups.
+            if rm.scope_metrics().next().is_none() {
+                continue;
+            }
+            if let Err(e) = self.exporter.export(&rm).await {
+                log::warn!("Failed to export metrics for cgroup {}: {e}", cg.name);
+            }
         }
     }
 }

@@ -28,6 +28,7 @@ opentelemetry_sdk = { version = "0.32", features = [
     "trace",
     "logs",
     "experimental_metrics_bound_instruments",
+    "experimental_metrics_custom_reader",
 ] }
 opentelemetry-appender-log = "0.32"
 tracing-opentelemetry = "0.33.0"

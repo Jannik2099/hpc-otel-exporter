@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
-use libbpf_rs::RingBufferBuilder;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
+use libbpf_rs::{MapHandle, RingBufferBuilder};
 use log::info;
 use tokio::io::unix::AsyncFd;
 use tokio::signal;
@@ -44,6 +44,10 @@ pub struct Args {
     /// Interval in seconds between draining and pushing CPU profiles
     #[arg(long, default_value_t = 5)]
     profile_interval_secs: u64,
+
+    /// Interval in seconds between collecting and exporting metrics
+    #[arg(long, default_value_t = 5)]
+    metrics_interval_secs: u64,
 
     /// Base URL of the Pyroscope ingest endpoint
     #[arg(long, default_value = "http://localhost:4040")]
@@ -137,6 +141,24 @@ async fn run_async(args: Args) -> Result<()> {
         profiler.attach(&skel.progs.do_sample, args.profile_frequency)?;
     }
 
+    // The unwind-miss sink is a cloneable `Arc<Mutex<..>>` the ringbuffer callback
+    // writes into; grab it now, before the profiler is moved behind its own mutex.
+    let miss_sink = profiler.as_ref().map(|p| p.miss_sink());
+
+    // Owned, fd-dup'd handles to the maps the periodic tasks touch. `MapHandle` is
+    // `Send + Sync + 'static` (unlike the skel-borrowed `Map`), so it can move into
+    // independently spawned tasks without tying them to the skel's lifetime.
+    let unwind_rows = MapHandle::try_from(&skel.maps.UNWIND_ROWS)?;
+    let executables = MapHandle::try_from(&skel.maps.EXECUTABLES)?;
+    let proc_mappings = MapHandle::try_from(&skel.maps.PROC_MAPPINGS)?;
+    let stack_counts = MapHandle::try_from(&skel.maps.STACK_COUNTS)?;
+    let stacks = MapHandle::try_from(&skel.maps.STACKS)?;
+
+    // Share the profiler between the cleanup task (needs `&mut` for `on_cleanup`)
+    // and the profile task; an async mutex because both hold the guard across
+    // `.await`.
+    let profiler = profiler.map(|p| Arc::new(tokio::sync::Mutex::new(p)));
+
     // Ring buffers: IO events -> IoMetrics; metadata events -> MetadataMetrics;
     // unwind misses -> the profiler's sink (only wired when profiling is on —
     // nothing writes misses otherwise).
@@ -169,8 +191,7 @@ async fn run_async(args: Args) -> Result<()> {
         });
         0
     })?;
-    if let Some(profiler) = &profiler {
-        let misses = profiler.miss_sink();
+    if let Some(misses) = miss_sink {
         rb_builder.add(&skel.maps.UNWIND_MISSES, move |data: &[u8]| {
             if data.len() >= std::mem::size_of::<UnwindMiss>() {
                 // Safety: the BPF program writes a UnwindMiss into this ring buffer;
@@ -192,9 +213,60 @@ async fn run_async(args: Args) -> Result<()> {
 
     info!("Waiting for events... Press Ctrl-C to exit.");
 
-    let mut cleanup_interval = tokio::time::interval(CLEANUP_INTERVAL);
-    let mut profile_interval =
-        tokio::time::interval(Duration::from_secs(args.profile_interval_secs.max(1)));
+    // Metrics export: pull every live cgroup's ManualReader and push it through the
+    // shared OTLP exporter.
+    let metrics_task = tokio::spawn({
+        let registry = Arc::clone(&registry);
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(args.metrics_interval_secs.max(1)));
+        async move {
+            loop {
+                interval.tick().await;
+                registry.collect_and_export_all().await;
+            }
+        }
+    });
+
+    // Dead-cgroup reaping + per-feature pruning: one walk of /sys/fs/cgroup tears
+    // down dead providers and yields the live snapshot every feature prunes against.
+    let cleanup_task = tokio::spawn({
+        let registry = Arc::clone(&registry);
+        let io_metrics = Arc::clone(&io_metrics);
+        let metadata_metrics = Arc::clone(&metadata_metrics);
+        let profiler = profiler.clone();
+        let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
+        async move {
+            loop {
+                interval.tick().await;
+                let live = registry.cleanup_dead_cgroups().await;
+                io_metrics.retain_live(&live);
+                metadata_metrics.retain_live(&live);
+                if let Some(profiler) = &profiler {
+                    let mut profiler = profiler.lock().await;
+                    profiler
+                        .on_cleanup(&live, &unwind_rows, &executables, &proc_mappings)
+                        .await;
+                }
+            }
+        }
+    });
+
+    // CPU profile drain + push, only when profiling is enabled.
+    let profile_task = profiler.as_ref().map(|profiler| {
+        let profiler = Arc::clone(profiler);
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(args.profile_interval_secs.max(1)));
+        tokio::spawn(async move {
+            loop {
+                interval.tick().await;
+                profiler
+                    .lock()
+                    .await
+                    .collect_and_push(&stack_counts, &stacks)
+                    .await;
+            }
+        })
+    });
 
     loop {
         tokio::select! {
@@ -206,31 +278,19 @@ async fn run_async(args: Args) -> Result<()> {
                     n => Err(std::io::Error::from_raw_os_error(-n)),
                 }
             }) => {},
-            _ = cleanup_interval.tick() => {
-                // One walk of /sys/fs/cgroup tears down dead providers and yields
-                // the live snapshot every feature prunes its own state against.
-                let live = registry.cleanup_dead_cgroups().await;
-                io_metrics.retain_live(&live);
-                metadata_metrics.retain_live(&live);
-                if let Some(profiler) = &mut profiler {
-                    profiler.on_cleanup(
-                        &live,
-                        &skel.maps.UNWIND_ROWS,
-                        &skel.maps.EXECUTABLES,
-                        &skel.maps.PROC_MAPPINGS,
-                    ).await;
-                }
-            }
-            _ = profile_interval.tick() => {
-                if let Some(profiler) = &profiler {
-                    profiler.collect_and_push(&skel.maps.STACK_COUNTS, &skel.maps.STACKS).await;
-                }
-            }
             _ = signal::ctrl_c() => {
                 info!("Ctrl-C received, exiting...");
                 break;
             }
         }
+    }
+
+    // Stop the periodic tasks before the skel drops. They hold only Arcs and
+    // fd-dup'd MapHandles (independent of the skel), so aborting is clean.
+    metrics_task.abort();
+    cleanup_task.abort();
+    if let Some(profile_task) = profile_task {
+        profile_task.abort();
     }
 
     Ok(())
