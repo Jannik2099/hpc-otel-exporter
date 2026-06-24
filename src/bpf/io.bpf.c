@@ -3,6 +3,8 @@
 
 #include "io.h"
 
+#include "vfs_common.bpf.h"
+
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
@@ -22,17 +24,6 @@ struct {
     __uint(max_entries, 1 << 22); // 4 MiB
 } EVENTS SEC(".maps");
 
-static __always_inline bool is_ephemeral_fs_cheap(enum FsMagic magic) {
-    return magic == ANON_INODE_FS_MAGIC || magic == TMPFS_MAGIC ||
-           magic == PIPEFS_MAGIC || magic == SYSFS_MAGIC ||
-           magic == PROC_SUPER_MAGIC || magic == SOCKFS_MAGIC ||
-           magic == CGROUP2_SUPER_MAGIC;
-}
-
-static __always_inline enum FsMagic get_fs_magic(const struct file *file) {
-    return file->f_path.mnt->mnt_sb->s_magic;
-}
-
 static __always_inline s32 file_to_mount_id(const struct file *file) {
     const struct vfsmount *vfsmount = file->f_path.mnt;
 
@@ -44,7 +35,7 @@ static __always_inline s32 file_to_mount_id(const struct file *file) {
 }
 
 static __always_inline void record_start(const struct file *file) {
-    const enum FsMagic magic = get_fs_magic(file);
+    const enum FsMagic magic = file_fs_magic(file);
     // Skip ephemeral filesystems
     if (is_ephemeral_fs_cheap(magic)) {
         return;
@@ -68,7 +59,7 @@ static __always_inline void record_end(const struct file *file, const s64 bytes,
         return;
     }
 
-    const enum FsMagic magic = get_fs_magic(file);
+    const enum FsMagic magic = file_fs_magic(file);
     if (is_ephemeral_fs_cheap(magic)) {
         return;
     }

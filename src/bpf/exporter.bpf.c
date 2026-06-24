@@ -7,4 +7,5 @@
 char LICENSE[] SEC("license") = "GPL";
 
 #include "io.bpf.c"
+#include "metadata.bpf.c"
 #include "profiling.bpf.c"

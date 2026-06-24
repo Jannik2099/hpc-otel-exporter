@@ -20,10 +20,10 @@ use log::info;
 use tokio::io::unix::AsyncFd;
 use tokio::signal;
 
-use crate::bindings::{IOEvent, UnwindMiss};
+use crate::bindings::{IOEvent, MetadataEvent, UnwindMiss};
 use crate::bpf::{self, ExporterSkelBuilder};
 use crate::cgroup::CgroupRegistry;
-use crate::metrics::{self, IoMetrics};
+use crate::metrics::{self, IoMetrics, MetadataMetrics};
 use crate::profiling::Profiler;
 use crate::telemetry;
 
@@ -91,12 +91,16 @@ pub async fn run(args: Args) -> Result<()> {
     let _tracing_guard = telemetry::init_tracing();
 
     // Single owner of per-cgroup meter providers and cgroup liveness, shared by
-    // every feature. IO contributes its histogram aggregation views.
-    let registry = Arc::new(CgroupRegistry::new(metrics::io::histogram_views()));
+    // every feature. IO and metadata each contribute their histogram aggregation
+    // views.
+    let mut histogram_views = metrics::io::histogram_views();
+    histogram_views.extend(metrics::metadata::histogram_views());
+    let registry = Arc::new(CgroupRegistry::new(histogram_views));
 
-    // IO metrics: shared behind an `Arc` so the EVENTS ringbuffer callback (a
-    // `'static` closure) can record into it.
+    // IO + metadata metrics: shared behind an `Arc` so the ringbuffer callbacks
+    // (`'static` closures) can record into them.
     let io_metrics = Arc::new(IoMetrics::new(Arc::clone(&registry)));
+    let metadata_metrics = Arc::new(MetadataMetrics::new(Arc::clone(&registry)));
 
     // CPU profiler facade: owns the perf sampler, the native unwinder's userspace
     // half, and the per-cgroup symbol caches. `None` when profiling is disabled.
@@ -113,8 +117,9 @@ pub async fn run(args: Args) -> Result<()> {
         profiler.attach(&skel.progs.do_sample, args.profile_frequency)?;
     }
 
-    // Ring buffers: IO events -> IoMetrics; unwind misses -> the profiler's sink
-    // (only wired when profiling is on — nothing writes misses otherwise).
+    // Ring buffers: IO events -> IoMetrics; metadata events -> MetadataMetrics;
+    // unwind misses -> the profiler's sink (only wired when profiling is on —
+    // nothing writes misses otherwise).
     let mut rb_builder = RingBufferBuilder::new();
     let io_for_cb = Arc::clone(&io_metrics);
     rb_builder.add(&skel.maps.EVENTS, move |data: &[u8]| {
@@ -128,6 +133,19 @@ pub async fn run(args: Args) -> Result<()> {
         // is sound).
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(io_for_cb.record(&event))
+        });
+        0
+    })?;
+    let metadata_for_cb = Arc::clone(&metadata_metrics);
+    rb_builder.add(&skel.maps.METADATA_EVENTS, move |data: &[u8]| {
+        if data.len() < std::mem::size_of::<MetadataEvent>() {
+            return 0;
+        }
+        // Safety: as above — the length check guarantees sufficient size, and we
+        // read unaligned since the slice carries no alignment guarantee.
+        let event = unsafe { (data.as_ptr() as *const MetadataEvent).read_unaligned() };
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(metadata_for_cb.record(&event))
         });
         0
     })?;
@@ -173,6 +191,7 @@ pub async fn run(args: Args) -> Result<()> {
                 // the live snapshot every feature prunes its own state against.
                 let live = registry.cleanup_dead_cgroups().await;
                 io_metrics.retain_live(&live);
+                metadata_metrics.retain_live(&live);
                 if let Some(profiler) = &mut profiler {
                     profiler.on_cleanup(
                         &live,
