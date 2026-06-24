@@ -13,8 +13,12 @@ const SHARED_HEADER: &str = "src/bpf/shared.h";
 /// retrigger the skeleton + bindgen build, but only `SRC` is compiled.
 const BPF_FRAGMENTS: &[&str] = &[
     "src/bpf/io.bpf.c",
+    "src/bpf/metadata.bpf.c",
     "src/bpf/profiling.bpf.c",
     "src/bpf/io.h",
+    "src/bpf/metadata.h",
+    "src/bpf/vfs_types.h",
+    "src/bpf/vfs_common.bpf.h",
     "src/bpf/profiling.h",
     "src/bpf/prelude.h",
 ];
@@ -188,6 +192,10 @@ fn generate_bindings(bpf_headers_dir: &Path, out_dir: &Path) {
         .allowlist_type("IOType")
         .rustified_enum("IOType")
         .allowlist_type("IOEvent")
+        // VFS metadata shared types (src/bpf/metadata.h).
+        .allowlist_type("MetadataEvent")
+        .allowlist_type("MetadataOp")
+        .rustified_enum("MetadataOp")
         .allowlist_type("StackKey")
         // Native-unwinder shared types (src/bpf/common_shared.h).
         .allowlist_type("UnwindRow")
