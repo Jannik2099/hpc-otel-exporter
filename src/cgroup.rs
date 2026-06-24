@@ -181,12 +181,35 @@ impl CgroupRegistry {
             .filter(|id| !live.contains(id))
             .collect();
 
-        for id in dead {
-            if let Some((_, cg)) = self.cgroups.remove(&id) {
-                log::info!("Removing cgroup {}", cg.name);
-                if let Err(e) = cg.provider.shutdown() {
-                    log::warn!("Failed to shut down provider for cgroup {}: {e}", cg.name);
+        // Drop dead cgroups from the map first (cheap, non-blocking), then shut their
+        // providers down off the async runtime.
+        let dead_meters: Vec<Arc<CgroupMeter>> = dead
+            .into_iter()
+            .filter_map(|id| self.cgroups.remove(&id).map(|(_, cg)| cg))
+            .collect();
+
+        if !dead_meters.is_empty() {
+            // `SdkMeterProvider::shutdown()` blocks the calling thread (up to 5s) while
+            // it signals each `PeriodicReader`'s background thread to do a final export
+            // and exit. That final export is `futures_executor::block_on(exporter.export())`
+            // on the reader's own thread, and it can only make progress while the tokio
+            // runtime is free to drive the shared OTLP/tonic channel. If we ran shutdown
+            // directly on the event-loop worker, we'd starve that export: it would stall,
+            // shutdown would time out, and the (detached) reader thread would be orphaned.
+            // So we run the shutdowns on a blocking thread and await the handle:
+            // that await is the join we cannot do on the SDK's own
+            // detached thread, so we do not return until every dead reader has stopped.
+            if let Err(e) = tokio::task::spawn_blocking(move || {
+                for cg in dead_meters {
+                    log::info!("Removing cgroup {}", cg.name);
+                    if let Err(e) = cg.provider.shutdown() {
+                        log::warn!("Failed to shut down provider for cgroup {}: {e}", cg.name);
+                    }
                 }
+            })
+            .await
+            {
+                log::warn!("Cgroup provider shutdown task failed to join: {e}");
             }
         }
 
