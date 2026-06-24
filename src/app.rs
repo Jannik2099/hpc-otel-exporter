@@ -222,7 +222,9 @@ async fn run_async(args: Args) -> Result<()> {
         async move {
             loop {
                 interval.tick().await;
-                registry.collect_and_export_all().await;
+                // Returns immediately after spawning one export task per cgroup, so a
+                // slow export never delays the next tick.
+                registry.collect_and_export_all();
             }
         }
     });

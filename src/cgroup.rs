@@ -21,7 +21,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use dashmap::mapref::one::{Ref, RefMut};
@@ -40,6 +40,11 @@ use opentelemetry_sdk::metrics::{
 use rustc_hash::{FxBuildHasher, FxHashSet};
 
 use crate::telemetry::build_resource;
+
+/// An export taking at least this long is logged as slow. The per-cgroup payloads
+/// here are kilobytes, so a healthy export is milliseconds; crossing this points at
+/// the shared OTLP channel stalling (reconnect, retry/backoff, server backpressure).
+const SLOW_EXPORT_THRESHOLD: Duration = Duration::from_secs(2);
 
 /// A metric [view] a feature contributes to every per-cgroup meter provider: given
 /// an [`Instrument`], it optionally returns the [`Stream`] (aggregation) to use for
@@ -274,33 +279,47 @@ impl CgroupRegistry {
     }
 
     /// Collect every live cgroup's [`ManualReader`] and push it through the shared
-    /// OTLP exporter. Driven by a single timer in [`crate::app`], this replaces the
-    /// per-provider background threads a [`PeriodicReader`] would otherwise spawn —
-    /// one export task instead of one OS thread per cgroup.
+    /// OTLP exporter, each cgroup in its own tokio task. Driven by a single timer in
+    /// [`crate::app`], this replaces the per-provider background threads a
+    /// [`PeriodicReader`] would otherwise spawn.
     ///
     /// [`PeriodicReader`]: opentelemetry_sdk::metrics::PeriodicReader
-    pub async fn collect_and_export_all(&self) {
-        // Snapshot the providers so no DashMap guard is held across the `.await`
-        // below (holding one risks deadlocking `get_or_create`; see [`PerCgroup`]).
+    pub fn collect_and_export_all(&self) {
+        // Snapshot the providers so we hold no DashMap guard while spawning (a guard
+        // held across the spawned tasks' work risks deadlocking `get_or_create`).
         let cgroups: Vec<Arc<CgroupMeter>> =
             self.cgroups.iter().map(|e| Arc::clone(e.value())).collect();
 
         for cg in cgroups {
-            let mut rm = ResourceMetrics::default();
-            if let Err(e) = cg.reader.collect(&mut rm) {
-                log::warn!("Failed to collect metrics for cgroup {}: {e}", cg.name);
-                continue;
-            }
-            // Skip a genuinely empty payload — a provider whose instruments have
-            // never recorded a measurement. Under cumulative temporality an active
-            // cgroup keeps re-exporting its running totals even while idle, so this
-            // does not drop data for quiet-but-live cgroups.
-            if rm.scope_metrics().next().is_none() {
-                continue;
-            }
-            if let Err(e) = self.exporter.export(&rm).await {
-                log::warn!("Failed to export metrics for cgroup {}: {e}", cg.name);
-            }
+            let exporter = self.exporter.clone();
+            tokio::spawn(async move {
+                let mut rm = ResourceMetrics::default();
+                match cg.reader.collect(&mut rm) {
+                    Err(e) => log::warn!("Failed to collect metrics for cgroup {}: {e}", cg.name),
+                    // Skip a genuinely empty payload — a provider whose instruments
+                    // recorded nothing this window (delta) and so has no data points.
+                    Ok(()) if rm.scope_metrics().next().is_none() => {}
+                    Ok(()) => {
+                        let start = Instant::now();
+                        let result = exporter.export(&rm).await;
+                        let elapsed = start.elapsed();
+                        match result {
+                            // Flag a slow-but-successful export
+                            Ok(()) if elapsed >= SLOW_EXPORT_THRESHOLD => log::warn!(
+                                "Slow metric export for cgroup {} took {:.1}s",
+                                cg.name,
+                                elapsed.as_secs_f64()
+                            ),
+                            Ok(()) => {}
+                            Err(e) => log::warn!(
+                                "Failed to export metrics for cgroup {} after {:.1}s: {e}",
+                                cg.name,
+                                elapsed.as_secs_f64()
+                            ),
+                        }
+                    }
+                }
+            });
         }
     }
 }
