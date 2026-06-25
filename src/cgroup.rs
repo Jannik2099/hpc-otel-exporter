@@ -561,7 +561,11 @@ async fn resolve_cgroup_name_via_proc(cgroup_id: u64, tgid: u32) -> Resolution {
 pub(crate) async fn resolve_cgroup_name(id: u64) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
 
-    let cgroup_root = Path::new("/sys/fs/cgroup");
+    // Walk only the cgroup v2 (unified) mount: ids come from
+    // `bpf_get_current_cgroup_id` (v2 inodes), and on a hybrid layout the v1
+    // controller trees are separate kernfs filesystems whose inode spaces collide
+    // with v2 ids — matching one would name the wrong cgroup.
+    let cgroup_root = cgroup2_mount_point();
     let mut stack = vec![cgroup_root.to_path_buf()];
 
     while let Some(current) = stack.pop() {
@@ -569,8 +573,11 @@ pub(crate) async fn resolve_cgroup_name(id: u64) -> Option<String> {
             continue;
         };
         if meta.ino() == id {
+            // Name relative to the tmpfs root (not the v2 mount), so on a hybrid
+            // layout this yields `unified/...` — matching the `/proc` resolver's
+            // output so the two paths never split a series.
             return current
-                .strip_prefix(cgroup_root)
+                .strip_prefix("/sys/fs/cgroup")
                 .unwrap_or(&current)
                 .to_string_lossy()
                 .into_owned()
@@ -593,7 +600,13 @@ pub(crate) async fn resolve_cgroup_name(id: u64) -> Option<String> {
 }
 
 pub(crate) async fn collect_live_cgroup_ids() -> FxHashSet<u64> {
-    walk_cgroup_dir(Path::new("/sys/fs/cgroup")).await
+    // Walk only the cgroup v2 (unified) mount. Tracked ids are v2 inodes; on a
+    // hybrid v1+v2 layout the v1 controller trees under `/sys/fs/cgroup` are
+    // separate kernfs filesystems with their own inode spaces that collide with v2
+    // ids. Folding those in here makes a dead v2 cgroup look alive whenever some
+    // unrelated live v1 directory shares its inode, so its provider is never torn
+    // down — the duplicate-"Adding cgroup", never-"Removing cgroup" leak.
+    walk_cgroup_dir(cgroup2_mount_point()).await
 }
 
 async fn walk_cgroup_dir(dir: &Path) -> FxHashSet<u64> {
