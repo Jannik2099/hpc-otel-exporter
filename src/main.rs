@@ -12,6 +12,7 @@ mod bindings;
 mod bpf;
 mod cgroup;
 mod metrics;
+mod numa;
 mod profiling;
 #[cfg(feature = "pyroscope")]
 mod self_profile;

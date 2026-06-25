@@ -22,6 +22,7 @@
 #include "metadata.h"
 
 #include "cgroup_id.bpf.h"
+#include "numa_ringbuf.bpf.h"
 #include "vfs_common.bpf.h"
 
 #include <bpf/bpf_core_read.h>
@@ -67,11 +68,9 @@ struct {
 } META_STORAGE SEC(".maps");
 
 // Completed VFS metadata operations (struct MetadataEvent), drained by
-// userspace metadata metrics.
-struct {
-    __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 22); // 4 MiB
-} METADATA_EVENTS SEC(".maps");
+// userspace metadata metrics. One ring buffer per NUMA node (see
+// numa_ringbuf.bpf.h); the recording CPU reserves in its local node's ring.
+DEFINE_NUMA_RINGBUF(METADATA_EVENTS);
 
 static __always_inline void meta_start(const enum MetadataOp op,
                                        const struct dentry *dentry) {
@@ -124,7 +123,7 @@ static __always_inline void meta_end(const enum MetadataOp op, void *ctx) {
     bpf_get_func_ret(ctx, &ret);
 
     struct MetadataEvent *const event =
-        bpf_ringbuf_reserve(&METADATA_EVENTS, sizeof(struct MetadataEvent), 0);
+        numa_ringbuf_reserve(&METADATA_EVENTS, sizeof(struct MetadataEvent));
     if (event == NULL) {
         return;
     }

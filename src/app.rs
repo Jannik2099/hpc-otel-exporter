@@ -10,6 +10,7 @@
 use std::mem::MaybeUninit;
 use std::os::fd::BorrowedFd;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -20,10 +21,11 @@ use log::info;
 use tokio::io::unix::AsyncFd;
 use tokio::signal;
 
-use crate::bindings::{IOEvent, MetadataEvent, UnwindMiss};
+use crate::bindings::UnwindMiss;
 use crate::bpf::{self, ExporterSkelBuilder};
 use crate::cgroup::{CgroupMode, CgroupRegistry};
 use crate::metrics::{self, IoMetrics, MetadataMetrics};
+use crate::numa::{self, RawEvent};
 use crate::profiling::Profiler;
 use crate::telemetry;
 
@@ -141,15 +143,32 @@ async fn run_async(args: Args) -> Result<()> {
     // profiler below; keep skel.attach() from trying to auto-attach it.
     open_skel.progs.do_sample.set_autoattach(false);
 
-    // Load + attach all auto-attachable programs (fentry/fexit on vfs_read/write).
+    // Load all programs (fentry/fexit on vfs_read/write, the sampler).
     let mut skel = open_skel.load()?;
-    skel.attach()?;
 
-    info!("eBPF program loaded and attached!");
+    info!("eBPF program loaded!");
 
     if args.test_attach {
+        skel.attach()?;
+        info!("eBPF program attached!");
         return Ok(());
     }
+
+    // Per-NUMA-node event ring buffers. Created and inserted into the outer
+    // ARRAY_OF_MAPS *before* attaching, so every event finds a populated ring
+    // for its node; the draining threads start now and buffer into the channel
+    // until the record task (spawned below) drains it. Counts events dropped on
+    // channel overflow.
+    let dropped_events = Arc::new(AtomicU64::new(0));
+    let (mut event_rx, drainers) = numa::setup(
+        &skel.maps.EVENTS,
+        &skel.maps.METADATA_EVENTS,
+        Arc::clone(&dropped_events),
+    )?;
+
+    // Attach all auto-attachable programs now that their rings are wired up.
+    skel.attach()?;
+    info!("eBPF program attached!");
 
     // Install the global tracer provider (OTLP/gRPC), kept alive for the whole run
     // so buffered spans flush on exit. The demand-driven unwind loader and
@@ -201,39 +220,35 @@ async fn run_async(args: Args) -> Result<()> {
     // `.await`.
     let profiler = profiler.map(|p| Arc::new(tokio::sync::Mutex::new(p)));
 
-    // Ring buffers: IO events -> IoMetrics; metadata events -> MetadataMetrics;
-    // unwind misses -> the profiler's sink (only wired when profiling is on —
-    // nothing writes misses otherwise).
-    let mut rb_builder = RingBufferBuilder::new();
-    let io_for_cb = Arc::clone(&io_metrics);
-    rb_builder.add(&skel.maps.EVENTS, move |data: &[u8]| {
-        if data.len() < std::mem::size_of::<IOEvent>() {
-            return 0;
+    // IO + metadata events arrive via the per-NUMA-node draining threads (see
+    // `numa::setup` above) over `event_rx`; one task drains the channel and runs
+    // the async `record` path, serially as the single consume loop did before.
+    let record_task = tokio::spawn({
+        let io_metrics = Arc::clone(&io_metrics);
+        let metadata_metrics = Arc::clone(&metadata_metrics);
+        async move {
+            // Drain in batches to amortize the per-event await overhead.
+            let mut batch = Vec::with_capacity(1024);
+            loop {
+                let n = event_rx.recv_many(&mut batch, 1024).await;
+                if n == 0 {
+                    break; // all draining threads have stopped
+                }
+                for event in batch.drain(..) {
+                    match event {
+                        RawEvent::Io(e) => io_metrics.record(&e).await,
+                        RawEvent::Meta(e) => metadata_metrics.record(&e).await,
+                    }
+                }
+            }
         }
-        // Safety: BPF ringbuf data is 8-byte aligned (IOEvent needs 4); the length
-        // check guarantees sufficient size. Read unaligned to be safe regardless.
-        let event = unsafe { (data.as_ptr() as *const IOEvent).read_unaligned() };
-        // Block on the async record call (multi-threaded runtime, so block_in_place
-        // is sound).
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(io_for_cb.record(&event))
-        });
-        0
-    })?;
-    let metadata_for_cb = Arc::clone(&metadata_metrics);
-    rb_builder.add(&skel.maps.METADATA_EVENTS, move |data: &[u8]| {
-        if data.len() < std::mem::size_of::<MetadataEvent>() {
-            return 0;
-        }
-        // Safety: as above — the length check guarantees sufficient size, and we
-        // read unaligned since the slice carries no alignment guarantee.
-        let event = unsafe { (data.as_ptr() as *const MetadataEvent).read_unaligned() };
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(metadata_for_cb.record(&event))
-        });
-        0
-    })?;
-    if let Some(misses) = miss_sink {
+    });
+
+    // Unwind-miss ring buffer (a single global ring — low volume, only written
+    // when profiling is on). Drained on the tokio runtime via its epoll fd; when
+    // profiling is off there is no ring and the main loop just waits for Ctrl-C.
+    let misses_ringbuf = if let Some(misses) = miss_sink {
+        let mut rb_builder = RingBufferBuilder::new();
         rb_builder.add(&skel.maps.UNWIND_MISSES, move |data: &[u8]| {
             if data.len() >= std::mem::size_of::<UnwindMiss>() {
                 // Safety: the BPF program writes a UnwindMiss into this ring buffer;
@@ -243,22 +258,30 @@ async fn run_async(args: Args) -> Result<()> {
             }
             0
         })?;
-    }
-    let ringbuf = rb_builder.build()?;
+        Some(rb_builder.build()?)
+    } else {
+        None
+    };
 
-    // Wrap the ring buffer's epoll fd with tokio's AsyncFd for async polling.
-    let epoll_fd = ringbuf.epoll_fd();
-    let async_fd = AsyncFd::with_interest(
-        unsafe { BorrowedFd::borrow_raw(epoll_fd) },
-        tokio::io::Interest::READABLE,
-    )?;
+    // Wrap the unwind-miss ring's epoll fd with tokio's AsyncFd for async polling.
+    let misses_fd = misses_ringbuf
+        .as_ref()
+        .map(|rb| {
+            AsyncFd::with_interest(
+                unsafe { BorrowedFd::borrow_raw(rb.epoll_fd()) },
+                tokio::io::Interest::READABLE,
+            )
+        })
+        .transpose()?;
 
     info!("Waiting for events... Press Ctrl-C to exit.");
 
     // Metrics export: pull every live cgroup's ManualReader and push it through the
-    // shared OTLP exporter.
+    // shared OTLP exporter. Also surfaces the per-NUMA-node draining channel's
+    // overflow count, so a record loop that can't keep up is visible.
     let metrics_task = tokio::spawn({
         let registry = Arc::clone(&registry);
+        let dropped_events = Arc::clone(&dropped_events);
         let mut interval =
             tokio::time::interval(Duration::from_secs(args.metrics_interval_secs.max(1)));
         async move {
@@ -267,6 +290,10 @@ async fn run_async(args: Args) -> Result<()> {
                 // Returns immediately after spawning one export task per cgroup, so a
                 // slow export never delays the next tick.
                 registry.collect_and_export_all();
+                let dropped = dropped_events.swap(0, Ordering::Relaxed);
+                if dropped > 0 {
+                    log::warn!("dropped {dropped} events: record loop fell behind");
+                }
             }
         }
     });
@@ -313,16 +340,27 @@ async fn run_async(args: Args) -> Result<()> {
     });
 
     loop {
-        tokio::select! {
-            _ = async_fd.async_io(tokio::io::Interest::READABLE, |_| {
-                let consumed = ringbuf.consume_raw();
-                match consumed {
-                    n if n > 0 => Ok(n),
-                    0 => Err(std::io::ErrorKind::WouldBlock.into()),
-                    n => Err(std::io::Error::from_raw_os_error(-n)),
+        match (&misses_fd, &misses_ringbuf) {
+            // Profiling on: drain the unwind-miss ring alongside watching for Ctrl-C.
+            (Some(async_fd), Some(ringbuf)) => {
+                tokio::select! {
+                    _ = async_fd.async_io(tokio::io::Interest::READABLE, |_| {
+                        let consumed = ringbuf.consume_raw();
+                        match consumed {
+                            n if n > 0 => Ok(n),
+                            0 => Err(std::io::ErrorKind::WouldBlock.into()),
+                            n => Err(std::io::Error::from_raw_os_error(-n)),
+                        }
+                    }) => {},
+                    _ = signal::ctrl_c() => {
+                        info!("Ctrl-C received, exiting...");
+                        break;
+                    }
                 }
-            }) => {},
-            _ = signal::ctrl_c() => {
+            }
+            // Profiling off: nothing else to poll, just wait for Ctrl-C.
+            _ => {
+                let _ = signal::ctrl_c().await;
                 info!("Ctrl-C received, exiting...");
                 break;
             }
@@ -333,9 +371,13 @@ async fn run_async(args: Args) -> Result<()> {
     // fd-dup'd MapHandles (independent of the skel), so aborting is clean.
     metrics_task.abort();
     cleanup_task.abort();
+    record_task.abort();
     if let Some(profile_task) = profile_task {
         profile_task.abort();
     }
+    // Stop and join the per-NUMA-node draining threads before the skel (and its
+    // ring buffer maps) drop.
+    drainers.shutdown();
 
     Ok(())
 }
