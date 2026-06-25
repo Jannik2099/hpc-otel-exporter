@@ -22,7 +22,7 @@ use tokio::signal;
 
 use crate::bindings::{IOEvent, MetadataEvent, UnwindMiss};
 use crate::bpf::{self, ExporterSkelBuilder};
-use crate::cgroup::CgroupRegistry;
+use crate::cgroup::{CgroupMode, CgroupRegistry};
 use crate::metrics::{self, IoMetrics, MetadataMetrics};
 use crate::profiling::Profiler;
 use crate::telemetry;
@@ -60,6 +60,28 @@ pub struct Args {
     /// Number of threads to use for the tokio runtime (default: number of CPUs)
     #[arg(long)]
     num_threads: Option<usize>,
+
+    /// Group events by cgroup v1 `cpu,cpuacct` hierarchy instead of v2 (unified)
+    #[arg(long)]
+    use_cgroups_v1: bool,
+}
+
+/// Detect the cgroup v1 `cpu,cpuacct` hierarchy id from `/proc/self/cgroup` (the
+/// leading `N:` field of the line whose controller list contains `cpu`). The eBPF
+/// side passes it to `bpf_task_get_cgroup1` to fetch that hierarchy's cgroup.
+fn detect_cpu_v1_hierarchy_id() -> Option<i32> {
+    let content = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    content.lines().find_map(|line| {
+        // Format: `hierarchy-id:controller-list:path`.
+        let mut fields = line.splitn(3, ':');
+        let hid = fields.next()?;
+        let controllers = fields.next()?;
+        controllers
+            .split(',')
+            .any(|c| c == "cpu")
+            .then(|| hid.parse().ok())
+            .flatten()
+    })
 }
 
 /// Load and attach the eBPF object, wire up the telemetry features, and run the
@@ -95,6 +117,26 @@ async fn run_async(args: Args) -> Result<()> {
     let mut open_object = MaybeUninit::uninit();
     let mut open_skel = builder.open(&mut open_object)?;
 
+    // Select v1 vs v2 cgroup tracking before load: the eBPF side reads these
+    // rodata knobs (see src/bpf/cgroup_id.bpf.h) and the registry resolves the
+    // matching hierarchy. For v1 we pass the cpu,cpuacct hierarchy id so
+    // bpf_task_get_cgroup1 fetches the right cgroup.
+    let cgroup_mode = if args.use_cgroups_v1 {
+        let hierarchy_id = detect_cpu_v1_hierarchy_id()
+            .ok_or_else(|| anyhow::anyhow!("could not detect the cpu,cpuacct v1 hierarchy id"))?;
+        info!("tracking cgroup v1 (cpu,cpuacct hierarchy id {hierarchy_id})");
+        let rodata = open_skel
+            .maps
+            .rodata_data
+            .as_deref_mut()
+            .expect("BPF .rodata section present");
+        rodata.USE_CGROUPS_V1 = true;
+        rodata.CGROUP_V1_HID = hierarchy_id;
+        CgroupMode::V1
+    } else {
+        CgroupMode::V2
+    };
+
     // The perf_event sampler needs a per-CPU perf fd, so it is attached by the
     // profiler below; keep skel.attach() from trying to auto-attach it.
     open_skel.progs.do_sample.set_autoattach(false);
@@ -119,7 +161,7 @@ async fn run_async(args: Args) -> Result<()> {
     // views.
     let mut histogram_views = metrics::io::histogram_views();
     histogram_views.extend(metrics::metadata::histogram_views());
-    let registry = Arc::new(CgroupRegistry::new(histogram_views));
+    let registry = Arc::new(CgroupRegistry::new(histogram_views, cgroup_mode));
 
     // IO + metadata metrics: shared behind an `Arc` so the ringbuffer callbacks
     // (`'static` closures) can record into them.

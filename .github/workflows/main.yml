@@ -58,9 +58,10 @@ jobs:
           - distro: ubuntu
             release: "26.04"
             mirror: http://archive.ubuntu.com/ubuntu
-          - distro: ubuntu
-            release: "24.04"
-            mirror: http://archive.ubuntu.com/ubuntu
+          # dropped until cgroupsv1 support is conditionally compiled
+          #- distro: ubuntu
+          #  release: "24.04"
+          #  mirror: http://archive.ubuntu.com/ubuntu
       fail-fast: false
     needs: build_mkosi_tools
     runs-on: ubuntu-latest

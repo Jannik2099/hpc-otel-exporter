@@ -53,19 +53,30 @@ impl Pusher {
 
         let series = profiles
             .into_iter()
-            .map(|p| push::RawProfileSeries {
-                labels: vec![
+            .map(|p| {
+                let mut labels = vec![
                     label("__name__", PROFILE_NAME),
                     // Grafana groups profiles by service_name, so use the cgroup
                     // (i.e. the SLURM job / workload) as the service.
                     label("service_name", &p.cgroup_name),
                     label("exporter", "hpc-otel-exporter"),
                     label("hostname", &self.hostname),
-                ],
-                samples: vec![push::RawSample {
-                    raw_profile: gzip(&p.data),
-                    id: uuid::Uuid::now_v7().to_string(),
-                }],
+                ];
+                // SLURM job identity, mirroring the IO/metadata metric attributes
+                // (Pyroscope label values are strings).
+                if let Some(slurm) = &p.slurm {
+                    labels.push(label("slurm.job_id", &slurm.job_id.to_string()));
+                    if let Some(uid) = slurm.uid {
+                        labels.push(label("uid", &uid.to_string()));
+                    }
+                }
+                push::RawProfileSeries {
+                    labels,
+                    samples: vec![push::RawSample {
+                        raw_profile: gzip(&p.data),
+                        id: uuid::Uuid::now_v7().to_string(),
+                    }],
+                }
             })
             .collect();
         let request = push::PushRequest { series };
