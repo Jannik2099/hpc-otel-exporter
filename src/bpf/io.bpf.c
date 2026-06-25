@@ -4,6 +4,7 @@
 #include "io.h"
 
 #include "cgroup_id.bpf.h"
+#include "numa_ringbuf.bpf.h"
 #include "vfs_common.bpf.h"
 
 #include <bpf/bpf_core_read.h>
@@ -20,10 +21,9 @@ struct {
 } TASK_STORAGE SEC(".maps");
 
 // Completed IO operations (struct IOEvent), drained by userspace IO metrics.
-struct {
-    __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 22); // 4 MiB
-} EVENTS SEC(".maps");
+// One ring buffer per NUMA node (see numa_ringbuf.bpf.h); the recording CPU
+// reserves in its local node's ring.
+DEFINE_NUMA_RINGBUF(EVENTS);
 
 static __always_inline s32 file_to_mount_id(const struct file *file) {
     const struct vfsmount *vfsmount = file->f_path.mnt;
@@ -66,7 +66,7 @@ static __always_inline void record_end(const struct file *file, const s64 bytes,
     }
 
     struct IOEvent *const event =
-        bpf_ringbuf_reserve(&EVENTS, sizeof(struct IOEvent), 0);
+        numa_ringbuf_reserve(&EVENTS, sizeof(struct IOEvent));
     if (event == NULL) {
         return;
     }
