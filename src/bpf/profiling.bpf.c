@@ -4,6 +4,8 @@
 
 #include "profiling.h"
 
+#include "cgroup_id.bpf.h"
+
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
@@ -355,7 +357,7 @@ int do_sample(struct bpf_perf_event_data *ctx) {
         if (slot) {
             slot->tgid = tgid;
             slot->_pad = 0;
-            slot->cgroup_id = bpf_get_current_cgroup_id();
+            slot->cgroup_id = current_cgroup_id();
             bpf_ringbuf_submit(slot, 0);
         }
     }
@@ -374,7 +376,7 @@ int do_sample(struct bpf_perf_event_data *ctx) {
     bpf_map_update_elem(&STACKS, &stack_id, stack, BPF_ANY);
 
     struct StackKey key = {
-        .cgroup_id = bpf_get_current_cgroup_id(),
+        .cgroup_id = current_cgroup_id(),
         .tgid = tgid,
         .pid = pid,
         .stack_id = stack_id,

@@ -23,7 +23,7 @@ use prost::Message;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::bindings::StackKey;
-use crate::cgroup::{CgroupRegistry, PerCgroup};
+use crate::cgroup::{CgroupRegistry, PerCgroup, SlurmJob};
 
 mod debuginfod;
 mod perf_event;
@@ -51,6 +51,9 @@ const MAX_STACK_DEPTH: usize = crate::bindings::MAX_STACK_DEPTH as usize;
 /// A finished pprof profile for one cgroup, ready to push to Pyroscope.
 pub(crate) struct CpuProfile {
     pub(crate) cgroup_name: String,
+    /// SLURM job identity, when the cgroup is a job, attached as Pyroscope labels
+    /// (`slurm.job_id` / `uid`) alongside `service_name` (see [`push`]).
+    pub(crate) slurm: Option<SlurmJob>,
     /// Serialized `google.v1.Profile` (uncompressed; gzipped at push time).
     pub(crate) data: Vec<u8>,
 }
@@ -62,6 +65,16 @@ pub(crate) struct CpuProfile {
 struct CgroupSamples {
     /// tgid -> list of (leaf-first stack addresses, sample count).
     procs: HashMap<u32, Vec<(Vec<u64>, u64)>>,
+}
+
+impl CgroupSamples {
+    /// Fold another (leaf) cgroup's samples in, merging per-tgid stack lists. Used
+    /// to aggregate a SLURM job's `step_*/task_*` sub-cgroups into the job.
+    fn merge(&mut self, other: CgroupSamples) {
+        for (tgid, stacks) in other.procs {
+            self.procs.entry(tgid).or_default().extend(stacks);
+        }
+    }
 }
 
 /// The CPU profiler: drains the in-kernel stack aggregation, symbolizes, and
@@ -218,7 +231,7 @@ impl Profiler {
     /// 4. fold the results back into the caches, then
     /// 5. build each cgroup's profile from the now-warm caches.
     async fn collect(&self, counts: &impl MapCore, stacks: &impl MapCore) -> Vec<CpuProfile> {
-        let (mut by_cgroup, stack_ids) = self.drain_maps(counts, stacks);
+        let (raw_by_cgroup, stack_ids) = self.drain_maps(counts, stacks);
 
         // Free the stack-trace slots now that we've copied out what we need;
         // multiple count entries may share an id, hence the dedup above.
@@ -226,21 +239,26 @@ impl Profiler {
             let _ = stacks.delete(&id.to_ne_bytes());
         }
 
-        // Step 1b: ensure a cache exists for each cgroup. The shared registry
-        // resolves the cgroup name (the `service_name` label) and owns its meter
-        // provider; `None` means the cgroup is the root (rejected by Pyroscope
-        // anyway) or vanished between sampling and draining — drop it so later
-        // steps don't have to special-case it.
-        let cgroup_ids: Vec<u64> = by_cgroup.keys().copied().collect();
-        for cgroup_id in cgroup_ids {
-            if self
+        // Step 1b: canonicalize. Each raw (leaf) cgroup's samples fold into its
+        // canonical cgroup — the SLURM job for a job's `step_*/task_*`
+        // sub-cgroups, so one profile covers the whole job — while ensuring a
+        // symbol cache exists per canonical cgroup. The registry resolves the
+        // cgroup name (the `service_name` label) and owns its meter provider;
+        // `None` means the root cgroup (rejected by Pyroscope anyway) or one that
+        // vanished between sampling and draining — drop it so later steps don't
+        // have to special-case it.
+        let mut by_cgroup: HashMap<u64, CgroupSamples> = HashMap::new();
+        for (raw_id, samples) in raw_by_cgroup {
+            let Some(cache) = self
                 .cgroups
-                .get_or_create(cgroup_id, None, |meter| CgroupCache::new(Arc::clone(meter)))
+                .get_or_create(raw_id, None, |meter| CgroupCache::new(Arc::clone(meter)))
                 .await
-                .is_none()
-            {
-                by_cgroup.remove(&cgroup_id);
-            }
+            else {
+                continue;
+            };
+            let canonical_id = *cache.key();
+            drop(cache);
+            by_cgroup.entry(canonical_id).or_default().merge(samples);
         }
 
         // Step 2: build the symbolization queue (reads caches), step 3: resolve
@@ -265,6 +283,7 @@ impl Profiler {
             };
             profiles.push(CpuProfile {
                 cgroup_name: cg.meter.name.clone(),
+                slurm: cg.meter.slurm.clone(),
                 data,
             });
         }

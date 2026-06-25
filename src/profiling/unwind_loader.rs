@@ -233,14 +233,20 @@ impl UnwindLoader {
             return; // already loaded and unchanged (covers permanent-gap re-misses)
         }
 
-        // Resolving the cgroup (via the registry) gives us its name for spans/logs.
-        // `None` is the root cgroup or one that vanished — we still load its tables,
-        // just without per-cgroup metrics, and label spans/logs "unknown".
-        let cgroup_name = self
+        // Resolving the cgroup (via the registry) gives us its name for spans/logs
+        // and its canonical (job-aggregated) id. `None` is the root cgroup or one
+        // that vanished — we still load its tables, just without per-cgroup metrics,
+        // and label spans/logs "unknown".
+        let resolved = self
             .cgroup_metrics
             .registry()
             .get_or_create(cgroup_id, Some(pid))
-            .await
+            .await;
+        // Track this pid under the canonical cgroup so its unwind footprint groups
+        // with the rest of the SLURM job; fall back to the raw id for the
+        // root/unresolved cgroup (which carries no per-cgroup metrics anyway).
+        let canonical_id = resolved.as_ref().map(|m| m.id).unwrap_or(cgroup_id);
+        let cgroup_name = resolved
             .map(|m| m.name.clone())
             .unwrap_or_else(|| "unknown".to_owned());
         let process_name = process_name(pid).await;
@@ -343,7 +349,7 @@ impl UnwindLoader {
                 return None;
             }
 
-            self.commit_refs(pid, sig, cgroup_id, referenced, rows, execs);
+            self.commit_refs(pid, sig, canonical_id, referenced, rows, execs);
 
             span.record("unwind.mappings", entries.len());
             span.record("unwind.libraries_read", libraries_read);

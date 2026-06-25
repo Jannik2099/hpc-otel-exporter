@@ -21,6 +21,7 @@
 
 #include "metadata.h"
 
+#include "cgroup_id.bpf.h"
 #include "vfs_common.bpf.h"
 
 #include <bpf/bpf_core_read.h>
@@ -133,7 +134,7 @@ static __always_inline void meta_end(const enum MetadataOp op, void *ctx) {
     event->time_info.start_time = start_time;
     event->time_info.end_time = end_time;
     event->fs_magic = magic;
-    event->cgroup_id = bpf_get_current_cgroup_id();
+    event->cgroup_id = current_cgroup_id();
     event->op = op;
     event->pid = pid_tgid & 0xFFFFFFFF;
     event->tgid = pid_tgid >> 32;

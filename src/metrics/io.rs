@@ -182,9 +182,13 @@ impl IoMetrics {
         let io_type_name = if io_type { "write" } else { "read" };
         let fs_magic = event.fs_magic as u64;
 
+        // Key bound attribute sets by the canonical (job-aggregated) cgroup id, not
+        // the raw event id, so a SLURM job's sub-cgroups share one series.
+        let cgroup_id = *metrics.key();
+
         let histograms = self
             .attrs_to_metrics
-            .entry((event.cgroup_id, io_type, fs_magic))
+            .entry((cgroup_id, io_type, fs_magic))
             .or_insert_with(|| {
                 let mut attrs = vec![
                     KeyValue::new("io.type", io_type_name),
@@ -194,6 +198,8 @@ impl IoMetrics {
                 if let Some(fs_name) = event.fs_magic.magic_to_pretty_name() {
                     attrs.push(KeyValue::new("fs.type", fs_name));
                 }
+                // SLURM job identity (uid / slurm.job_id), when applicable.
+                metrics.meter.push_slurm_attrs(&mut attrs);
                 // see opentelemetry-sdk sort_and_dedup
                 attrs.sort_unstable_by(|a, b| a.key.cmp(&b.key));
                 attrs.dedup_by(|a, b| a.key == b.key);

@@ -20,6 +20,7 @@ const BPF_FRAGMENTS: &[&str] = &[
     "src/bpf/vfs_types.h",
     "src/bpf/vfs_common.bpf.h",
     "src/bpf/profiling.h",
+    "src/bpf/cgroup_id.bpf.h",
     "src/bpf/prelude.h",
 ];
 const PPROF_PROTO: &str = "profile.proto";

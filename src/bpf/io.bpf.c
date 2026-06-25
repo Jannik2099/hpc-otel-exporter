@@ -3,6 +3,7 @@
 
 #include "io.h"
 
+#include "cgroup_id.bpf.h"
 #include "vfs_common.bpf.h"
 
 #include <bpf/bpf_core_read.h>
@@ -93,7 +94,7 @@ static __always_inline void record_end(const struct file *file, const s64 bytes,
     event->time_info.end_time = end_time;
     event->fs_magic = magic;
     event->inode = file->f_inode->i_ino;
-    event->cgroup_id = bpf_get_current_cgroup_id();
+    event->cgroup_id = current_cgroup_id();
     event->num_bytes_transferred = num_bytes_transferred;
     event->mount_id = file_to_mount_id(file);
     event->pid = pid_tgid & 0xFFFFFFFF;
