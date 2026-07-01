@@ -148,8 +148,8 @@ impl MetadataMetrics {
                 if let Some(fs_name) = event.fs_magic.magic_to_pretty_name() {
                     attrs.push(KeyValue::new("fs.type", fs_name));
                 }
-                // SLURM job identity (uid / slurm.job_id), when applicable.
-                metrics.meter.push_slurm_attrs(&mut attrs);
+                // Filter-contributed identity, when any.
+                metrics.meter.push_attrs(&mut attrs);
                 // see opentelemetry-sdk sort_and_dedup
                 attrs.sort_unstable_by(|a, b| a.key.cmp(&b.key));
                 attrs.dedup_by(|a, b| a.key == b.key);

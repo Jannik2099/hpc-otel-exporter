@@ -62,13 +62,12 @@ impl Pusher {
                     label("exporter", "hpc-otel-exporter"),
                     label("hostname", &self.hostname),
                 ];
-                // SLURM job identity, mirroring the IO/metadata metric attributes
-                // (Pyroscope label values are strings).
-                if let Some(slurm) = &p.slurm {
-                    labels.push(label("slurm.job_id", &slurm.job_id.to_string()));
-                    if let Some(uid) = slurm.uid {
-                        labels.push(label("uid", &uid.to_string()));
-                    }
+                // Filter-contributed identity, mirroring
+                // the IO/metadata metric attributes.
+                // Pyroscope label values are strings,
+                // so numeric attributes stringify to their digits.
+                for kv in &p.attrs {
+                    labels.push(label(kv.key.as_str(), &kv.value.to_string()));
                 }
                 push::RawProfileSeries {
                     labels,

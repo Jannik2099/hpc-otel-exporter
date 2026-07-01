@@ -11,6 +11,7 @@ mod app;
 mod bindings;
 mod bpf;
 mod cgroup;
+mod cgroup_filter;
 mod metrics;
 mod numa;
 mod profiling;
