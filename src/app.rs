@@ -33,6 +33,22 @@ use crate::telemetry;
 /// pruned (and the profiler services unwind misses / evicts dead processes).
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
 
+/// A telemetry signal the exporter can collect, selected via `--signals`. Each
+/// maps to a feature: an eBPF program set that is attached (or not) and the
+/// userspace half that records it. With none given on the CLI, all are enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Signal {
+    /// VFS metadata-operation duration metrics (the `meta_*` eBPF programs).
+    #[value(name = "vfs_metadata")]
+    VfsMetadata,
+    /// VFS data read/write operation metrics (the `record_*` eBPF programs).
+    #[value(name = "io_requests")]
+    IoRequests,
+    /// CPU profiles sampled via perf_event.
+    #[value(name = "cpu_profiles")]
+    CpuProfiles,
+}
+
 #[derive(Debug, Parser)]
 pub struct Args {
     /// test whether attaching the eBPF programs succeeds and exit
@@ -55,9 +71,11 @@ pub struct Args {
     #[arg(long, default_value = "http://localhost:4040")]
     pyroscope_url: String,
 
-    /// Disable CPU profiling entirely
-    #[arg(long)]
-    no_profiling: bool,
+    /// Comma-separated list of signals to collect.
+    /// Known: `vfs_metadata`, `io_requests`, `cpu_profiles`.
+    /// Empty (the default) enables every signal.
+    #[arg(long, value_delimiter = ',', value_enum)]
+    signals: Vec<Signal>,
 
     /// Number of threads to use for the tokio runtime (default: number of CPUs)
     #[arg(long)]
@@ -122,6 +140,13 @@ async fn run_async(args: Args) -> Result<()> {
     let filters = crate::cgroup_filter::parse_filters(&args.cgroup_filters)
         .map_err(|e| anyhow::anyhow!(e))?;
 
+    // Which signals to collect. With none given on the CLI, enable all of them;
+    // otherwise each feature is gated on being named in `--signals`.
+    let all_signals = args.signals.is_empty();
+    let metadata_enabled = all_signals || args.signals.contains(&Signal::VfsMetadata);
+    let io_enabled = all_signals || args.signals.contains(&Signal::IoRequests);
+    let profiling_enabled = all_signals || args.signals.contains(&Signal::CpuProfiles);
+
     // Optional self-profiling of the exporter itself (separate from the target
     // profiling in `profiling`); kept alive for the process' lifetime.
     #[cfg(feature = "pyroscope")]
@@ -159,7 +184,21 @@ async fn run_async(args: Args) -> Result<()> {
     // profiler below; keep skel.attach() from trying to auto-attach it.
     open_skel.progs.do_sample.set_autoattach(false);
 
-    // Load all programs (fentry/fexit on vfs_read/write, the sampler).
+    // Suppress the eBPF programs behind any disabled signal so skel.attach()
+    // skips them: no probes on the kernel VFS paths whose events nobody consumes.
+    // The IO feature's programs are named `record_*`, the metadata feature's
+    // `meta_*` (the profiler's `do_sample` is already handled above).
+    if !io_enabled || !metadata_enabled {
+        for mut prog in open_skel.open_object_mut().progs_mut() {
+            let name = prog.name().to_string_lossy();
+            let disabled = (!io_enabled && name.starts_with("record_"))
+                || (!metadata_enabled && name.starts_with("meta_"));
+            if disabled {
+                prog.set_autoattach(false);
+            }
+        }
+    }
+
     let mut skel = open_skel.load()?;
 
     info!("eBPF program loaded!");
@@ -204,13 +243,14 @@ async fn run_async(args: Args) -> Result<()> {
     ));
 
     // IO + metadata metrics: shared behind an `Arc` so the ringbuffer callbacks
-    // (`'static` closures) can record into them.
-    let io_metrics = Arc::new(IoMetrics::new(Arc::clone(&registry)));
-    let metadata_metrics = Arc::new(MetadataMetrics::new(Arc::clone(&registry)));
+    // (`'static` closures) can record into them. `None` when the signal is off.
+    let io_metrics = io_enabled.then(|| Arc::new(IoMetrics::new(Arc::clone(&registry))));
+    let metadata_metrics =
+        metadata_enabled.then(|| Arc::new(MetadataMetrics::new(Arc::clone(&registry))));
 
     // CPU profiler facade: owns the perf sampler, the native unwinder's userspace
     // half, and the per-cgroup symbol caches. `None` when profiling is disabled.
-    let mut profiler = (!args.no_profiling).then(|| {
+    let mut profiler = profiling_enabled.then(|| {
         Profiler::new(
             args.pyroscope_url.clone(),
             telemetry::hostname(),
@@ -245,8 +285,8 @@ async fn run_async(args: Args) -> Result<()> {
     // `numa::setup` above) over `event_rx`; one task drains the channel and runs
     // the async `record` path, serially as the single consume loop did before.
     let record_task = tokio::spawn({
-        let io_metrics = Arc::clone(&io_metrics);
-        let metadata_metrics = Arc::clone(&metadata_metrics);
+        let io_metrics = io_metrics.clone();
+        let metadata_metrics = metadata_metrics.clone();
         async move {
             // Drain in batches to amortize the per-event await overhead.
             let mut batch = Vec::with_capacity(1024);
@@ -256,9 +296,19 @@ async fn run_async(args: Args) -> Result<()> {
                     break; // all draining threads have stopped
                 }
                 for event in batch.drain(..) {
+                    // The matching program set is only attached when its signal is
+                    // enabled, so the `None` arm never actually fires; guard anyway.
                     match event {
-                        RawEvent::Io(e) => io_metrics.record(&e).await,
-                        RawEvent::Meta(e) => metadata_metrics.record(&e).await,
+                        RawEvent::Io(e) => {
+                            if let Some(m) = &io_metrics {
+                                m.record(&e).await;
+                            }
+                        }
+                        RawEvent::Meta(e) => {
+                            if let Some(m) = &metadata_metrics {
+                                m.record(&e).await;
+                            }
+                        }
                     }
                 }
             }
@@ -323,16 +373,20 @@ async fn run_async(args: Args) -> Result<()> {
     // down dead providers and yields the live snapshot every feature prunes against.
     let cleanup_task = tokio::spawn({
         let registry = Arc::clone(&registry);
-        let io_metrics = Arc::clone(&io_metrics);
-        let metadata_metrics = Arc::clone(&metadata_metrics);
+        let io_metrics = io_metrics.clone();
+        let metadata_metrics = metadata_metrics.clone();
         let profiler = profiler.clone();
         let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
         async move {
             loop {
                 interval.tick().await;
                 let live = registry.cleanup_dead_cgroups().await;
-                io_metrics.retain_live(&live);
-                metadata_metrics.retain_live(&live);
+                if let Some(m) = &io_metrics {
+                    m.retain_live(&live);
+                }
+                if let Some(m) = &metadata_metrics {
+                    m.retain_live(&live);
+                }
                 if let Some(profiler) = &profiler {
                     let mut profiler = profiler.lock().await;
                     profiler
