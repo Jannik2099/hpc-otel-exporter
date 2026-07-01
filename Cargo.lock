@@ -889,6 +889,7 @@ dependencies = [
  "lru",
  "memmap2",
  "mimalloc",
+ "nix 0.31.3",
  "object 0.39.1",
  "opentelemetry",
  "opentelemetry-appender-log",
