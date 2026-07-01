@@ -21,6 +21,7 @@
 
 use std::path::Path;
 
+use nix::unistd::{Uid, User};
 use opentelemetry::KeyValue;
 
 /// The verdict a [`CgroupFilter`] returns for one cgroup path.
@@ -142,7 +143,10 @@ impl CgroupFilter for SlurmFilter {
 
         let mut attrs = vec![KeyValue::new("slurm.job_id", parsed.job.job_id as i64)];
         if let Some(uid) = parsed.job.uid {
-            attrs.push(KeyValue::new("uid", i64::from(uid)));
+            attrs.push(KeyValue::new("user.id", i64::from(uid)));
+            if let Ok(Some(user)) = User::from_uid(Uid::from_raw(uid)) {
+                attrs.push(KeyValue::new("user.name", user.name));
+            }
         }
 
         Filtered::Coalesce { coalesce_to, attrs }
@@ -166,9 +170,14 @@ impl CgroupFilter for UserSessionFilter {
         };
         let uid = user_slice_uid(comps[idx]).expect("position matched");
 
+        let mut attrs = vec![KeyValue::new("user.id", i64::from(uid))];
+        if let Ok(Some(user)) = User::from_uid(Uid::from_raw(uid)) {
+            attrs.push(KeyValue::new("user.name", user.name));
+        }
+
         Filtered::Coalesce {
             coalesce_to: comps[..=idx].join("/"),
-            attrs: vec![KeyValue::new("uid", i64::from(uid))],
+            attrs,
         }
     }
 }
@@ -248,29 +257,25 @@ mod tests {
     use super::*;
 
     /// Assert `filtered` is a `Coalesce` with the given fields; returns nothing.
-    fn assert_coalesce(filtered: Filtered, coalesce_to: &str, attrs: &[(&str, i64)]) {
+    fn assert_coalesce(filtered: Filtered, coalesce_to: &str, attrs: &[(&str, &str)]) {
         match filtered {
             Filtered::Coalesce {
                 coalesce_to: c,
                 attrs: a,
             } => {
                 assert_eq!(c, coalesce_to);
-                let got: Vec<(String, i64)> = a
+                let got: Vec<(String, String)> = a
                     .iter()
-                    .map(|kv| (kv.key.to_string(), value_as_i64(&kv.value)))
+                    .map(|kv| (kv.key.to_string(), kv.value.to_string()))
                     .collect();
-                let want: Vec<(String, i64)> =
-                    attrs.iter().map(|(k, v)| ((*k).to_owned(), *v)).collect();
-                assert_eq!(got, want);
+                for attr in attrs {
+                    assert!(
+                        got.contains(&(attr.0.to_string(), attr.1.to_string())),
+                        "missing attr {attr:?}",
+                    );
+                }
             }
             _ => panic!("expected Coalesce"),
-        }
-    }
-
-    fn value_as_i64(v: &opentelemetry::Value) -> i64 {
-        match v {
-            opentelemetry::Value::I64(i) => *i,
-            other => panic!("expected I64 attr value, got {other:?}"),
         }
     }
 
@@ -318,13 +323,13 @@ mod tests {
         assert_coalesce(
             SlurmFilter.apply("slurm/uid_38262/job_1349782/step_interactive/task_0"),
             "slurm/uid_38262/job_1349782",
-            &[("slurm.job_id", 1349782), ("uid", 38262)],
+            &[("slurm.job_id", "1349782"), ("user.id", "38262")],
         );
         // v2 layout without a uid segment: no uid attribute.
         assert_coalesce(
             SlurmFilter.apply("system.slice/slurmstepd.scope/job_42/step_0/task_0"),
             "system.slice/slurmstepd.scope/job_42",
-            &[("slurm.job_id", 42)],
+            &[("slurm.job_id", "42")],
         );
     }
 
@@ -343,19 +348,19 @@ mod tests {
         assert_coalesce(
             UserSessionFilter.apply("user.slice/user-1000.slice/session-3.scope/app.service"),
             "user.slice/user-1000.slice",
-            &[("uid", 1000)],
+            &[("user.id", "1000")],
         );
         // A user@<uid>.service tree under the same slice folds onto the slice too.
         assert_coalesce(
             UserSessionFilter.apply("user.slice/user-1000.slice/user@1000.service/foo.service"),
             "user.slice/user-1000.slice",
-            &[("uid", 1000)],
+            &[("user.id", "1000")],
         );
         // The bare per-user slice coalesces onto itself.
         assert_coalesce(
             UserSessionFilter.apply("user.slice/user-42.slice"),
             "user.slice/user-42.slice",
-            &[("uid", 42)],
+            &[("user.id", "42")],
         );
     }
 
@@ -385,7 +390,11 @@ mod tests {
         let job =
             apply_filters(&filters, "slurm/uid_38262/job_1349782/step_0/task_0", false).unwrap();
         assert_eq!(job.path, "slurm/uid_38262/job_1349782");
-        assert_eq!(job.attrs.len(), 2);
+        assert!(
+            job.attrs
+                .contains(&KeyValue::new("slurm.job_id", 1349782i64))
+        );
+        assert!(job.attrs.contains(&KeyValue::new("user.id", 38262i64)));
 
         // A user-session path is passed through by slurm, coalesced by the second.
         let user = apply_filters(
@@ -395,7 +404,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(user.path, "user.slice/user-1000.slice");
-        assert_eq!(user.attrs.len(), 1);
+        assert!(user.attrs.contains(&KeyValue::new("user.id", 1000i64)));
     }
 
     #[test]
