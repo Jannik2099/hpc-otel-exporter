@@ -45,6 +45,7 @@ pub fn setup_pyroscope(
 
     let owned_tags: Vec<(String, String)> = resource
         .iter()
+        .filter(|(key, _)| key.as_str() != "service.name") // Pyroscope sets this itself
         .map(|(key, value)| (sanitize_tag_key(key.as_str()), value.as_str().into_owned()))
         .collect();
     let tags: Vec<(&str, &str)> = owned_tags
