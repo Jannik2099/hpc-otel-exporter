@@ -23,8 +23,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use dashmap::DashMap;
 use dashmap::mapref::one::{Ref, RefMut};
+use dashmap::{DashMap, DashSet};
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Meter, MeterProvider};
 use opentelemetry_otlp::{
@@ -40,6 +40,7 @@ use opentelemetry_sdk::metrics::{
 };
 use rustc_hash::{FxBuildHasher, FxHashSet};
 
+use crate::cgroup_filter::{CgroupFilter, apply_filters};
 use crate::telemetry::build_resource;
 
 /// An export taking at least this long is logged as slow. The per-cgroup payloads
@@ -67,18 +68,6 @@ pub enum CgroupMode {
     /// The v1 `cpu,cpuacct` hierarchy: `bpf_task_get_cgroup1`, anchored under the
     /// cpu v1 mount.
     V1,
-}
-
-/// The SLURM identity of a tracked job cgroup, attached to its [`CgroupMeter`] so
-/// every feature can stamp its metrics/profiles with the same `uid` /
-/// `slurm.job_id` labels. Present only for cgroups whose path is a SLURM job (see
-/// [`parse_slurm`]); `None` for ordinary system/user cgroups.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SlurmJob {
-    pub job_id: u64,
-    /// The owning user, from the `uid_<N>` path segment when present (v1 layout);
-    /// `None` when the layout carries no uid segment (some v2 layouts).
-    pub uid: Option<u32>,
 }
 
 /// Wraps the OTLP [`MetricExporter`] in an `Arc` so every per-cgroup provider's
@@ -161,9 +150,8 @@ pub struct CgroupMeter {
     /// key their own [`PerCgroup`] state by this, not by the raw event id.
     pub id: u64,
     pub name: String,
-    /// SLURM identity, when this cgroup is a job (see [`SlurmJob`]); `None`
-    /// otherwise. Read by features to add `uid` / `slurm.job_id` attributes.
-    pub slurm: Option<SlurmJob>,
+    /// Extra attributes contributed by filters for this cgroup
+    pub attrs: Vec<KeyValue>,
     pub meter: Meter,
     provider: SdkMeterProvider,
     /// The provider's reader, shared so [`CgroupRegistry::collect_and_export_all`]
@@ -172,17 +160,12 @@ pub struct CgroupMeter {
 }
 
 impl CgroupMeter {
-    /// Append this cgroup's SLURM identity to `attrs` — `slurm.job_id`, plus `uid`
-    /// when the layout carried one. A no-op for non-SLURM cgroups. Shared by the IO
-    /// and metadata metrics so every series for a job carries the same labels (the
-    /// CPU profiles attach the equivalent Pyroscope labels in `profiling::push`).
-    pub fn push_slurm_attrs(&self, attrs: &mut Vec<KeyValue>) {
-        if let Some(slurm) = &self.slurm {
-            attrs.push(KeyValue::new("slurm.job_id", slurm.job_id as i64));
-            if let Some(uid) = slurm.uid {
-                attrs.push(KeyValue::new("uid", i64::from(uid)));
-            }
-        }
+    /// Append this cgroup's filter-contributed attributes to `attrs`.
+    /// Shared by the IO and metadata metrics
+    /// so every series for a cgroup carries the same labels.
+    /// The CPU profiles attach the equivalent Pyroscope labels in `profiling::push`.
+    pub fn push_attrs(&self, attrs: &mut Vec<KeyValue>) {
+        attrs.extend(self.attrs.iter().cloned());
     }
 
     /// Build a standalone meter backed by an unread [`ManualReader`], for tests
@@ -197,7 +180,7 @@ impl CgroupMeter {
         Arc::new(CgroupMeter {
             id: 1,
             name: name.to_owned(),
-            slurm: None,
+            attrs: Vec::new(),
             meter,
             provider,
             reader,
@@ -237,7 +220,7 @@ pub struct CgroupRegistry {
     /// (e.g. its emitting task had already exited) gets retried.
     ///
     /// [`cleanup_dead_cgroups`]: Self::cleanup_dead_cgroups
-    unresolved: DashMap<u64, (), FxBuildHasher>,
+    unresolved: DashSet<u64, FxBuildHasher>,
     /// Which hierarchy (v1/v2) we track; selects the `/proc/<tgid>/cgroup` line
     /// and which mount [`root`](Self::root) is anchored/walked.
     mode: CgroupMode,
@@ -250,6 +233,13 @@ pub struct CgroupRegistry {
     /// Per-provider metric views contributed by features (see [`CgroupView`]),
     /// applied to each cgroup's provider as it is created.
     views: Vec<CgroupView>,
+    /// The ordered cgroup filters, run over each
+    /// leaf cgroup path in [`canonicalize`](Self::canonicalize).
+    /// Empty = every leaf cgroup tracked on its own, unfiltered.
+    filters: Vec<Box<dyn CgroupFilter>>,
+    /// When set, drop any cgroup no filter coalesced, so only
+    /// filter-claimed cgroups are tracked (a whitelist).
+    drop_unhandled: bool,
 }
 
 impl CgroupRegistry {
@@ -257,7 +247,12 @@ impl CgroupRegistry {
     /// created lazily on first use, each configured with the feature-contributed
     /// `views` (e.g. the IO histogram aggregations from
     /// [`crate::metrics::io::histogram_views`]).
-    pub fn new(views: Vec<CgroupView>, mode: CgroupMode) -> Self {
+    pub fn new(
+        views: Vec<CgroupView>,
+        mode: CgroupMode,
+        filters: Vec<Box<dyn CgroupFilter>>,
+        drop_unhandled: bool,
+    ) -> Self {
         let exporter = MetricExporter::builder()
             .with_tonic()
             .with_protocol(Protocol::Grpc)
@@ -274,12 +269,14 @@ impl CgroupRegistry {
         Self {
             cgroups: DashMap::default(),
             raw_to_canonical: DashMap::default(),
-            unresolved: DashMap::default(),
+            unresolved: DashSet::default(),
             mode,
             root,
             resource: build_resource(),
             exporter: SharedExporter(Arc::new(exporter)),
             views,
+            filters,
+            drop_unhandled,
         }
     }
 
@@ -308,7 +305,7 @@ impl CgroupRegistry {
         {
             return Some(Arc::clone(&cg));
         }
-        if self.unresolved.contains_key(&cgroup_id) {
+        if self.unresolved.contains(&cgroup_id) {
             return None;
         }
 
@@ -320,7 +317,7 @@ impl CgroupRegistry {
             // event from the same id is rejected without redoing the work (until the
             // next cleanup clears the negative cache).
             LeafResolution::Unnameable => {
-                self.unresolved.insert(cgroup_id, ());
+                self.unresolved.insert(cgroup_id);
                 return None;
             }
             // Could only fail to confirm via `/proc` (the hinting task has since
@@ -330,9 +327,17 @@ impl CgroupRegistry {
             LeafResolution::Unconfirmed => return None,
         };
 
-        // Resolving the canonical id may stat the SLURM job dir; a failure there is
-        // a transient race, not cacheable.
-        let info = self.canonicalize(&leaf, cgroup_id).await?;
+        // Run the cgroup filters and resolve the canonical id. A filter may
+        // drop the cgroup (cacheable), or stat'ing a coalesce target may fail
+        // (a transient race, not cacheable).
+        let info = match self.canonicalize(&leaf, cgroup_id).await {
+            Canonicalized::Resolved(info) => info,
+            Canonicalized::Dropped => {
+                self.unresolved.insert(cgroup_id);
+                return None;
+            }
+            Canonicalized::Transient => return None,
+        };
 
         let canonical_id = info.canonical_id;
         let meter = Arc::clone(
@@ -415,43 +420,47 @@ impl CgroupRegistry {
         }
     }
 
-    /// Map a resolved leaf cgroup path to the **canonical** cgroup we track it
-    /// under: for a SLURM job (`.../job_<N>/...`) that's the job cgroup (so its
-    /// `step_*/task_*` sub-cgroups collapse into one series), otherwise the leaf
-    /// itself. Returns `None` only when the SLURM job dir can't be stat'd right now
-    /// (a transient race — not cached).
-    async fn canonicalize(&self, leaf: &Path, raw_id: u64) -> Option<ResolvedInfo> {
+    /// Run the cgroup filter chain over a resolved leaf cgroup path to find the
+    /// **canonical** cgroup we should track it under.
+    /// A filter may collapse the leaf onto an ancestor,
+    /// (e.g. a SLURM job, or a user's `user-<uid>.slice`), or drop the cgroup.
+    /// That ancestor dir is stat'd for the canonical inode.
+    /// With no filter matching, the leaf is tracked as itself (canonical id = `raw_id`).
+    async fn canonicalize(&self, leaf: &Path, raw_id: u64) -> Canonicalized {
         use std::os::unix::fs::MetadataExt;
 
-        // Path relative to the tracked mount, for SLURM detection.
-        let rel = leaf.strip_prefix(&self.root).unwrap_or(leaf);
+        // Path relative to the tracked mount - what filters match against, and the
+        // leaf's own display name when nothing coalesces it.
+        let rel = leaf
+            .strip_prefix(&self.root)
+            .unwrap_or(leaf)
+            .to_string_lossy()
+            .into_owned();
 
-        if let Some(job) = parse_slurm(rel) {
-            // The job cgroup is the first `job.depth` components under the mount.
-            let job_dir: PathBuf = self
-                .root
-                .join(rel.iter().take(job.depth).collect::<PathBuf>());
-            let Ok(meta) = tokio::fs::metadata(&job_dir).await else {
-                return None; // job dir vanished mid-resolve: retry next event
-            };
-            Some(ResolvedInfo {
-                canonical_id: meta.ino(),
-                name: format!("job_{}", job.job.job_id),
-                slurm: Some(job.job),
-            })
+        let Some(outcome) = apply_filters(&self.filters, &rel, self.drop_unhandled) else {
+            // A filter dropped this cgroup, or `--drop-unhandled` dropped one no
+            // filter claimed.
+            return Canonicalized::Dropped;
+        };
+
+        // When no filter rewrote the path, the leaf is its own canonical cgroup and
+        // its inode is the raw event id, no extra stat needed. Otherwise the
+        // coalesce target is a real ancestor dir we stat for the canonical inode.
+        let canonical_id = if outcome.path == rel {
+            raw_id
         } else {
-            // Non-SLURM: track the leaf as-is.
-            let name = leaf
-                .strip_prefix(&self.root)
-                .unwrap_or(leaf)
-                .to_string_lossy()
-                .into_owned();
-            Some(ResolvedInfo {
-                canonical_id: raw_id,
-                name,
-                slurm: None,
-            })
-        }
+            match tokio::fs::metadata(self.root.join(&outcome.path)).await {
+                Ok(meta) => meta.ino(),
+                // Coalesce target vanished mid-resolve: retry next event.
+                Err(_) => return Canonicalized::Transient,
+            }
+        };
+
+        Canonicalized::Resolved(ResolvedInfo {
+            canonical_id,
+            path: outcome.path,
+            attrs: outcome.attrs,
+        })
     }
 
     /// Walk the tracked mount, shut down + drop providers whose cgroup no longer
@@ -495,10 +504,10 @@ impl CgroupRegistry {
     fn create_meter(&self, info: ResolvedInfo) -> CgroupMeter {
         let ResolvedInfo {
             canonical_id,
-            name,
-            slurm,
+            path,
+            attrs,
         } = info;
-        log::info!("Adding cgroup {name}");
+        log::info!("Adding cgroup {path}");
 
         // A thread-free `ManualReader` per provider. The registry's single export
         // timer (`collect_and_export_all`) pulls it through the shared OTLP
@@ -525,8 +534,8 @@ impl CgroupRegistry {
 
         CgroupMeter {
             id: canonical_id,
-            name,
-            slurm,
+            name: path,
+            attrs,
             meter,
             provider,
             reader,
@@ -689,61 +698,27 @@ enum LeafResolution {
 /// The tracked-cgroup identity a leaf path canonicalizes to (see
 /// [`CgroupRegistry::canonicalize`]).
 struct ResolvedInfo {
-    /// The canonical tracked id (SLURM job dir inode, or the raw leaf id).
+    /// The canonical tracked id (a coalesced ancestor dir's inode, or the raw
+    /// leaf id when no filter coalesced it).
     canonical_id: u64,
-    /// Display name (`job_<N>` for SLURM, else the `/sys/fs/cgroup`-relative path).
-    name: String,
-    slurm: Option<SlurmJob>,
+    /// The mount-relative leaf path.
+    path: String,
+    /// Filter-contributed attributes (e.g. `slurm.job_id`, `uid`); empty when no
+    /// filter tagged this cgroup.
+    attrs: Vec<KeyValue>,
 }
 
-/// A parsed SLURM job cgroup path: the [`SlurmJob`] identity plus how many leading
-/// path components form the job cgroup (everything below it — `step_*`, `task_*`,
-/// `user`, … — is aggregated into the job).
-struct SlurmParse {
-    job: SlurmJob,
-    /// Number of leading components of the mount-relative path, up to and
-    /// including `job_<N>`, that name the job cgroup directory.
-    depth: usize,
-}
-
-/// Detect a SLURM job in a mount-relative cgroup path and find the job cgroup to
-/// aggregate it into. Generic across the v1 layout (`slurm/uid_<U>/job_<J>/step_*/
-/// task_*`) and v2 layouts (which may differ and may omit the `uid_` segment): we
-/// key purely off the first `job_<digits>` component, and pick up an `uid_<digits>`
-/// component preceding it when present. Returns `None` for non-SLURM cgroups.
-fn parse_slurm(rel: &Path) -> Option<SlurmParse> {
-    let comps: Vec<&str> = rel
-        .iter()
-        .filter_map(|c| c.to_str())
-        .filter(|c| !c.is_empty())
-        .collect();
-
-    let job_idx = comps
-        .iter()
-        .position(|c| parse_prefixed_u64(c, "job_").is_some())?;
-    let job_id = parse_prefixed_u64(comps[job_idx], "job_")?;
-
-    // The owning uid, from a `uid_<N>` segment before the job component (v1).
-    let uid = comps[..job_idx]
-        .iter()
-        .rev()
-        .find_map(|c| parse_prefixed_u64(c, "uid_"))
-        .and_then(|u| u32::try_from(u).ok());
-
-    Some(SlurmParse {
-        job: SlurmJob { job_id, uid },
-        depth: job_idx + 1,
-    })
-}
-
-/// Parse `<prefix><digits>` (e.g. `job_1349782`) into the trailing number, or
-/// `None` if the component doesn't have the prefix or isn't all-digits after it.
-fn parse_prefixed_u64(component: &str, prefix: &str) -> Option<u64> {
-    let digits = component.strip_prefix(prefix)?;
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse().ok()
+/// Outcome of [`CgroupRegistry::canonicalize`], distinguishing a resolved cgroup
+/// from the cacheable "a filter dropped it" verdict and the transient "couldn't
+/// stat the coalesce target right now" one, which must not be cached (see
+/// [`CgroupRegistry::get_or_create`]).
+enum Canonicalized {
+    /// The cgroup resolved to a tracked series.
+    Resolved(ResolvedInfo),
+    /// A filter dropped this cgroup. Cacheable.
+    Dropped,
+    /// The coalesce target dir couldn't be stat'd (a race). Not cacheable.
+    Transient,
 }
 
 /// The cgroup v2 (unified) mount point, as reported by `/proc/self/mountinfo`,
@@ -922,41 +897,6 @@ mod tests {
         // Pure v2: no v1 cgroup mount at all.
         let v2_only = "26 25 0:24 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw,nsdelegate\n";
         assert_eq!(parse_cpu_v1_mount(v2_only), None);
-    }
-
-    #[test]
-    fn parse_slurm_v1_layout() {
-        // v1: /slurm/uid_<U>/job_<J>/step_<S>/task_<T>.
-        let parsed = parse_slurm(Path::new(
-            "slurm/uid_38262/job_1349782/step_interactive/task_0",
-        ))
-        .expect("recognized as a SLURM job");
-        assert_eq!(parsed.job.job_id, 1349782);
-        assert_eq!(parsed.job.uid, Some(38262));
-        // Canonical job dir = slurm/uid_38262/job_1349782 (3 components).
-        assert_eq!(parsed.depth, 3);
-    }
-
-    #[test]
-    fn parse_slurm_v2_layout_without_uid() {
-        // A v2-style layout that carries no uid_ segment: uid is omitted, the job
-        // is still recognized and aggregated at the job_ component.
-        let parsed = parse_slurm(Path::new(
-            "system.slice/slurmstepd.scope/job_42/step_0/user/task_special",
-        ))
-        .expect("recognized as a SLURM job");
-        assert_eq!(parsed.job.job_id, 42);
-        assert_eq!(parsed.job.uid, None);
-        assert_eq!(parsed.depth, 3); // system.slice/slurmstepd.scope/job_42
-    }
-
-    #[test]
-    fn parse_slurm_rejects_non_slurm_and_malformed() {
-        assert!(parse_slurm(Path::new("system.slice/chronyd.service")).is_none());
-        assert!(parse_slurm(Path::new("user.slice/user-1000.slice")).is_none());
-        // `job_` with no digits, or non-numeric, is not a job component.
-        assert!(parse_slurm(Path::new("slurm/job_/step_0")).is_none());
-        assert!(parse_slurm(Path::new("slurm/job_abc")).is_none());
     }
 
     /// On a cgroup v2 host, resolving our own pid's cgroup id via `/proc` must

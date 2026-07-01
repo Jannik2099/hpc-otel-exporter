@@ -23,7 +23,7 @@ use prost::Message;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::bindings::StackKey;
-use crate::cgroup::{CgroupRegistry, PerCgroup, SlurmJob};
+use crate::cgroup::{CgroupRegistry, PerCgroup};
 
 mod debuginfod;
 mod perf_event;
@@ -51,9 +51,10 @@ const MAX_STACK_DEPTH: usize = crate::bindings::MAX_STACK_DEPTH as usize;
 /// A finished pprof profile for one cgroup, ready to push to Pyroscope.
 pub(crate) struct CpuProfile {
     pub(crate) cgroup_name: String,
-    /// SLURM job identity, when the cgroup is a job, attached as Pyroscope labels
-    /// (`slurm.job_id` / `uid`) alongside `service_name` (see [`push`]).
-    pub(crate) slurm: Option<SlurmJob>,
+    /// Filter-contributed attributes, attached as
+    /// Pyroscope labels alongside `service_name` (see [`push`]).
+    /// Empty when no filter tagged the cgroup.
+    pub(crate) attrs: Vec<opentelemetry::KeyValue>,
     /// Serialized `google.v1.Profile` (uncompressed; gzipped at push time).
     pub(crate) data: Vec<u8>,
 }
@@ -283,7 +284,7 @@ impl Profiler {
             };
             profiles.push(CpuProfile {
                 cgroup_name: cg.meter.name.clone(),
-                slurm: cg.meter.slurm.clone(),
+                attrs: cg.meter.attrs.clone(),
                 data,
             });
         }

@@ -219,6 +219,26 @@ impl UnwindLoader {
         execs: &impl MapCore,
         procs: &impl MapCore,
     ) {
+        // Resolve the cgroup first, through the same registry interface the metrics
+        // recorders use: `get_or_create` returns `None` for a cgroup no filter
+        // tracks (dropped by `--cgroup-filters`/`--drop-unhandled`, or the
+        // root/unnameable). Such a cgroup is ignored entirely — skip before doing
+        // any work (reading maps, parsing unwind info) for its processes. On a
+        // tracked cgroup it also gives us the shared meter: its name (for spans/logs)
+        // and canonical (job-aggregated) id.
+        let Some(meter) = self
+            .cgroup_metrics
+            .registry()
+            .get_or_create(cgroup_id, Some(pid))
+            .await
+        else {
+            return;
+        };
+        // Track this pid under the canonical cgroup so its unwind footprint groups
+        // with the rest of the SLURM job.
+        let canonical_id = meter.id;
+        let cgroup_name = meter.name.clone();
+
         let content = match tokio::fs::read_to_string(format!("/proc/{pid}/maps")).await {
             Ok(c) => c,
             // The process exited; forget it and release its table references.
@@ -233,22 +253,6 @@ impl UnwindLoader {
             return; // already loaded and unchanged (covers permanent-gap re-misses)
         }
 
-        // Resolving the cgroup (via the registry) gives us its name for spans/logs
-        // and its canonical (job-aggregated) id. `None` is the root cgroup or one
-        // that vanished — we still load its tables, just without per-cgroup metrics,
-        // and label spans/logs "unknown".
-        let resolved = self
-            .cgroup_metrics
-            .registry()
-            .get_or_create(cgroup_id, Some(pid))
-            .await;
-        // Track this pid under the canonical cgroup so its unwind footprint groups
-        // with the rest of the SLURM job; fall back to the raw id for the
-        // root/unresolved cgroup (which carries no per-cgroup metrics anyway).
-        let canonical_id = resolved.as_ref().map(|m| m.id).unwrap_or(cgroup_id);
-        let cgroup_name = resolved
-            .map(|m| m.name.clone())
-            .unwrap_or_else(|| "unknown".to_owned());
         let process_name = process_name(pid).await;
 
         // Parent span: the demand-driven load triggered by an unwind miss. The
@@ -363,10 +367,9 @@ impl UnwindLoader {
             Some((libraries_read, libraries_failed))
         });
 
-        // Fold the load's counter deltas into the cgroup's metrics. `get_or_create`
-        // resolves the shared meter (a registry cache hit after the name lookup
-        // above) and returns `None` for the root/vanished cgroup, which carries no
-        // per-cgroup metrics — exactly the cases the old `meter` check handled.
+        // Fold the load's counter deltas into the cgroup's metrics. The cgroup is
+        // known tracked here (resolved above), so `get_or_create` is a registry
+        // cache hit that lazily builds this cgroup's `UnwindMetrics` on first load.
         if let Some((libraries_read, libraries_failed)) = load
             && let Some(metrics) = self
                 .cgroup_metrics

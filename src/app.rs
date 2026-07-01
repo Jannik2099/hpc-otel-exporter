@@ -66,6 +66,17 @@ pub struct Args {
     /// Group events by cgroup v1 `cpu,cpuacct` hierarchy instead of v2 (unified)
     #[arg(long)]
     use_cgroups_v1: bool,
+
+    /// Comma-separated cgroup coalescing filters, applied in order.
+    /// Known: `slurm`, `user-session`.
+    /// Empty (the default) tracks every cgroup unfiltered.
+    #[arg(long, value_delimiter = ',')]
+    cgroup_filters: Vec<String>,
+
+    /// Drop cgroups no `--cgroup-filters` filter handled, tracking only
+    /// filter-claimed cgroups (a whitelist). With no filters this drops everything.
+    #[arg(long)]
+    drop_unhandled: bool,
 }
 
 /// Detect the cgroup v1 `cpu,cpuacct` hierarchy id from `/proc/self/cgroup` (the
@@ -105,6 +116,11 @@ async fn run_async(args: Args) -> Result<()> {
     // flushes buffered records on exit and must outlive the whole run.
     let env_logger = env_logger::Env::default().filter_or("RUST_LOG", "debug");
     let _logging_guard = telemetry::init_logging(env_logger);
+
+    // Validate & build the coalescing filters up front,
+    // so a bad `--cgroup-filters` value fails fast with a clear error.
+    let filters = crate::cgroup_filter::parse_filters(&args.cgroup_filters)
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     // Optional self-profiling of the exporter itself (separate from the target
     // profiling in `profiling`); kept alive for the process' lifetime.
@@ -180,7 +196,12 @@ async fn run_async(args: Args) -> Result<()> {
     // views.
     let mut histogram_views = metrics::io::histogram_views();
     histogram_views.extend(metrics::metadata::histogram_views());
-    let registry = Arc::new(CgroupRegistry::new(histogram_views, cgroup_mode));
+    let registry = Arc::new(CgroupRegistry::new(
+        histogram_views,
+        cgroup_mode,
+        filters,
+        args.drop_unhandled,
+    ));
 
     // IO + metadata metrics: shared behind an `Arc` so the ringbuffer callbacks
     // (`'static` closures) can record into them.
