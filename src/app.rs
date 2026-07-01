@@ -150,7 +150,8 @@ async fn run_async(args: Args) -> Result<()> {
     // Optional self-profiling of the exporter itself (separate from the target
     // profiling in `profiling`); kept alive for the process' lifetime.
     #[cfg(feature = "pyroscope")]
-    let _pyroscope_agent = crate::self_profile::setup_pyroscope(&args.pyroscope_url);
+    let _pyroscope_agent =
+        crate::self_profile::setup_pyroscope(&args.pyroscope_url, &telemetry::build_resource());
 
     // Bump the memlock rlimit before loading (needed on older kernels).
     bpf::bump_memlock_rlimit();

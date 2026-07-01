@@ -7,10 +7,33 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
+use opentelemetry_sdk::Resource;
 use pyroscope::backend::{BackendConfig, PprofConfig, pprof_backend};
 use pyroscope::pyroscope::{PyroscopeAgent, PyroscopeAgentBuilder, PyroscopeAgentRunning};
 
-pub fn setup_pyroscope(url: &str) -> Result<PyroscopeAgent<PyroscopeAgentRunning>> {
+/// Rewrite an OTel resource/attribute key into a valid Pyroscope tag key.
+///
+/// Pyroscope (like Prometheus) only accepts tag keys matching `[a-zA-Z0-9_]+`
+/// and reserves the `__` prefix, whereas OTel uses dotted keys like
+/// `service.name`. Map every other character to `_` (so `service.name` becomes
+/// `service_name`) and prefix a leading digit with `_`.
+fn sanitize_tag_key(key: &str) -> String {
+    let mut out: String = key
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    if out.starts_with(|c: char| c.is_ascii_digit()) {
+        out.insert(0, '_');
+    }
+    out
+}
+
+/// Start the in-process Pyroscope agent, tagging every self-profile with the
+/// shared OTel resource attributes
+pub fn setup_pyroscope(
+    url: &str,
+    resource: &Resource,
+) -> Result<PyroscopeAgent<PyroscopeAgentRunning>> {
     let pyroscope_token = std::env::var("PYROSCOPE_BEARER_TOKEN").ok();
     let mut headers = HashMap::new();
     if let Some(pyroscope_token) = pyroscope_token {
@@ -19,6 +42,16 @@ pub fn setup_pyroscope(url: &str) -> Result<PyroscopeAgent<PyroscopeAgentRunning
             format!("Bearer {}", pyroscope_token),
         );
     }
+
+    let owned_tags: Vec<(String, String)> = resource
+        .iter()
+        .map(|(key, value)| (sanitize_tag_key(key.as_str()), value.as_str().into_owned()))
+        .collect();
+    let tags: Vec<(&str, &str)> = owned_tags
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+
     // Configure Pyroscope Agent
     let agent = PyroscopeAgentBuilder::new(
         url,
@@ -29,7 +62,7 @@ pub fn setup_pyroscope(url: &str) -> Result<PyroscopeAgent<PyroscopeAgentRunning
         pprof_backend(PprofConfig { sample_rate: 97 }, BackendConfig::default()),
     )
     .http_headers(headers)
-    .tags(vec![("env", "dev")])
+    .tags(tags)
     .build()?;
 
     Ok(agent.start()?)
