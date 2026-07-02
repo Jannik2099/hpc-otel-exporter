@@ -1,13 +1,27 @@
-//! eBPF object glue: the generated skeleton plus the memlock rlimit bump needed
-//! to load it on older kernels.
+//! eBPF object glue: one generated skeleton per signal (see `build.rs`'s
+//! `BPF_SRCS`), plus the memlock rlimit bump needed to load them on older
+//! kernels.
+//!
+//! Each signal is its own BPF object, so only the enabled signals' programs
+//! are verified and only their maps are created. The skeletons live in
+//! separate modules because each generated file defines same-named internals.
 
 use log::debug;
 
 #[allow(warnings)]
-mod skel {
-    include!(concat!(env!("OUT_DIR"), "/exporter.skel.rs"));
+pub mod io {
+    include!(concat!(env!("OUT_DIR"), "/io.skel.rs"));
 }
-pub use skel::*;
+
+#[allow(warnings)]
+pub mod metadata {
+    include!(concat!(env!("OUT_DIR"), "/metadata.skel.rs"));
+}
+
+#[allow(warnings)]
+pub mod profiling {
+    include!(concat!(env!("OUT_DIR"), "/profiling.skel.rs"));
+}
 
 /// Bump the memlock rlimit to infinity. Needed for older kernels that don't use
 /// the new memcg-based BPF memory accounting, see

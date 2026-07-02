@@ -5,16 +5,20 @@ use std::{
     process::Command,
 };
 
-const SRC: &str = "src/bpf/exporter.bpf.c";
-/// Bindgen entry point: aggregates every per-feature shared-type header so all
-/// shared structs/enums/constants land in one `crate::bindings` module.
-const SHARED_HEADER: &str = "src/bpf/shared.h";
-/// BPF sources/headers `#include`d into [`SRC`]. Changing any of them must
-/// retrigger the skeleton + bindgen build, but only `SRC` is compiled.
-const BPF_FRAGMENTS: &[&str] = &[
+/// One standalone BPF object per collected signal, each compiled into its own
+/// skeleton (`<name>.skel.rs`), so a signal's programs/maps only exist when the
+/// signal is enabled at runtime.
+const BPF_SRCS: &[&str] = &[
     "src/bpf/io.bpf.c",
     "src/bpf/metadata.bpf.c",
     "src/bpf/profiling.bpf.c",
+];
+/// Bindgen entry point: aggregates every per-feature shared-type header so all
+/// shared structs/enums/constants land in one `crate::bindings` module.
+const SHARED_HEADER: &str = "src/bpf/shared.h";
+/// Headers `#include`d into the [`BPF_SRCS`] objects. Changing any of them must
+/// retrigger the skeleton + bindgen build, but only the sources are compiled.
+const BPF_HEADERS: &[&str] = &[
     "src/bpf/io.h",
     "src/bpf/metadata.h",
     "src/bpf/vfs_types.h",
@@ -87,15 +91,21 @@ fn main() {
     // Generate Rust bindings from common_shared.h
     generate_bindings(&bpf_headers_dir, &out_dir);
 
-    // Build the BPF skeleton
-    let mut skel_path = out_dir.clone();
-    skel_path.push("exporter.skel.rs");
+    // Build one BPF skeleton per signal object.
+    for src in BPF_SRCS {
+        let stem = Path::new(src)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".bpf.c"))
+            .expect("BPF source named <name>.bpf.c");
+        let skel_path = out_dir.join(format!("{stem}.skel.rs"));
 
-    SkeletonBuilder::new()
-        .source(SRC)
-        .clang_args(&extra_clang_args)
-        .build_and_generate(&skel_path)
-        .expect("bpf compilation failed");
+        SkeletonBuilder::new()
+            .source(src)
+            .clang_args(&extra_clang_args)
+            .build_and_generate(&skel_path)
+            .unwrap_or_else(|e| panic!("bpf compilation of {src} failed: {e}"));
+    }
 
     let perf_bindings = bindgen::Builder::default()
         .header("bindgen/perf_event.h")
@@ -120,10 +130,9 @@ fn main() {
     println!("cargo:rerun-if-changed={}", PPROF_PROTO);
     println!("cargo:rerun-if-changed={}", PUSH_PROTO);
 
-    println!("cargo:rerun-if-changed={}", SRC);
     println!("cargo:rerun-if-changed={}", SHARED_HEADER);
-    for fragment in BPF_FRAGMENTS {
-        println!("cargo:rerun-if-changed={fragment}");
+    for path in BPF_SRCS.iter().chain(BPF_HEADERS) {
+        println!("cargo:rerun-if-changed={path}");
     }
 }
 
@@ -140,27 +149,30 @@ fn get_target_dir() -> PathBuf {
 
 fn generate_compile_commands(extra_clang_args: &Vec<&str>) {
     let project_root = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
-    let src_file = PathBuf::from(&project_root).join(SRC);
 
     let compile_commands_path = PathBuf::from(&project_root)
         .join("target")
         .join("compile_commands.json");
 
-    let mut args = vec!["clang", "-target", "bpf", "-g", "-O2"];
-    args.extend(extra_clang_args.iter().cloned());
-    args.extend(["-c", src_file.to_str().unwrap()]);
-    // Build the clang command that matches what libbpf-cargo uses
-    let compile_command = serde_json::json!([
-        {
-            "directory": project_root,
-            "file": src_file,
-            "arguments": args,
-        }
-    ]);
+    // One entry per BPF object, each matching the clang command libbpf-cargo uses.
+    let entries: Vec<serde_json::Value> = BPF_SRCS
+        .iter()
+        .map(|src| {
+            let src_file = PathBuf::from(&project_root).join(src);
+            let mut args = vec!["clang", "-target", "bpf", "-g", "-O2"];
+            args.extend(extra_clang_args.iter().cloned());
+            args.extend(["-c", src_file.to_str().unwrap()]);
+            serde_json::json!({
+                "directory": project_root,
+                "file": src_file,
+                "arguments": args,
+            })
+        })
+        .collect();
 
     fs::write(
         &compile_commands_path,
-        serde_json::to_string_pretty(&compile_command).unwrap(),
+        serde_json::to_string_pretty(&entries).unwrap(),
     )
     .expect("Failed to write compile_commands.json");
 
