@@ -1,40 +1,40 @@
 //! Per-NUMA-node ring buffer draining.
 //!
-//! The IO and metadata eBPF programs no longer write into a single global ring
+//! Event-producing eBPF programs do not write into a single global ring
 //! buffer; each writes into the ring buffer for the CPU's local NUMA node (an
 //! `ARRAY_OF_MAPS` keyed by `bpf_get_numa_node_id()`, see
 //! `src/bpf/numa_ringbuf.bpf.h`). A single global ring made every NUMA domain
 //! fight over one reserve spinlock + its cache line across the inter-node
 //! interconnect; sharding the ring per node keeps that lock node-local.
 //!
-//! This module:
+//! This module is feature-agnostic: each feature [`register`]s its outer
+//! `ARRAY_OF_MAPS` together with a decode callback, and [`DrainerBuilder::start`]
+//! then spawns one OS thread per node, pinned to that node's CPUs, that drains
+//! every registered feature's ring for that node. Registration:
 //!  1. enumerates the machine's NUMA nodes and their CPUs,
 //!  2. creates one NUMA-placed ring buffer per node per feature and inserts it
 //!     into the feature's outer array — done **before** the programs attach so
-//!     the very first event finds a ring for its node, and
-//!  3. spawns one OS thread per node, pinned to that node's CPUs, that drains
-//!     the node's IO + metadata rings and forwards decoded events down a
-//!     bounded channel to the async record loop in [`crate::app`].
+//!     the very first event finds a ring for its node.
 //!
 //! The draining thread does only the NUMA-local work (`ring_buffer__poll` +
-//! decode); the actual `record()` (which needs the tokio runtime for its slow
-//! `/proc` resolution path) runs on a tokio task draining the channel. Keeping
-//! the thread pinned to the producing node is the whole point — it ensures the
-//! ring's reserve/commit atomics and backing pages stay node-local.
+//! the feature's decode callback, which typically forwards down a bounded
+//! channel); anything slow (e.g. `/proc` resolution) belongs on the feature's
+//! own task consuming that channel. Keeping the thread pinned to the producing
+//! node is the whole point — it ensures the ring's reserve/commit atomics and
+//! backing pages stay node-local.
+//!
+//! [`register`]: DrainerBuilder::register
 
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::Result;
 use libbpf_rs::{MapCore, MapFlags, MapHandle, MapType, RingBufferBuilder};
 use log::{error, info, warn};
-use tokio::sync::mpsc;
-
-use crate::bindings::{IOEvent, MetadataEvent};
 
 /// Byte size of each per-node ring buffer. MUST stay in sync with
 /// `NUMA_RINGBUF_SIZE` in `src/bpf/numa_ringbuf.bpf.h`: the inner-map prototype
@@ -47,26 +47,114 @@ const RINGBUF_SIZE: u32 = 1 << 22; // 4 MiB
 /// rings carry exactly this flag to match the prototype's `map_flags`.
 const BPF_F_NUMA_NODE: u32 = 1 << 2;
 
-/// Bound on the channel buffering decoded events between the per-node draining
-/// threads and the async record task. On overflow events are dropped (and
-/// counted) rather than blocking the draining thread — the same drop-on-full
-/// behaviour the kernel ring buffer already has.
-const CHANNEL_CAPACITY: usize = 1 << 16;
-
 /// How long each draining thread blocks in `poll` before re-checking the stop
 /// flag. Only affects shutdown latency; events wake the poll immediately.
 const POLL_TIMEOUT: Duration = Duration::from_millis(200);
 
-/// A decoded event forwarded from a draining thread to the async record task.
-pub enum RawEvent {
-    Io(IOEvent),
-    Meta(MetadataEvent),
+/// A feature's decode callback, run on the draining thread for every raw ring
+/// payload. Shared behind an `Arc` because the same callback drains every
+/// node's ring for that feature. Must stay cheap and non-blocking (decode +
+/// `try_send`); drop-on-full is the callback's business, matching the
+/// drop-on-full behaviour the kernel ring buffer already has.
+pub type RingCallback = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
+/// Decode a POD event `T` from a raw ring payload, or `None` when the payload
+/// is too short. Reads unaligned: ring slices carry no alignment guarantee.
+pub fn decode_event<T: Copy>(data: &[u8]) -> Option<T> {
+    if data.len() < size_of::<T>() {
+        return None;
+    }
+    // Safety: length checked above, and the BPF side only ever submits a `T`
+    // into the ring this callback was registered for.
+    Some(unsafe { (data.as_ptr() as *const T).read_unaligned() })
 }
 
 /// A NUMA node and the CPUs that belong to it.
 struct NumaNode {
     id: u32,
     cpus: Vec<usize>,
+}
+
+/// One registered feature: its per-node rings (index-aligned with the builder's
+/// node list) and the callback that decodes its payloads.
+struct Source {
+    rings: Vec<MapHandle>,
+    cb: RingCallback,
+}
+
+/// Builder collecting every feature's per-node rings before the draining
+/// threads start. Features [`register`](Self::register) while wiring up (after
+/// their maps are loaded, before their programs attach); [`start`](Self::start)
+/// then spawns one pinned draining thread per node covering all of them.
+pub struct DrainerBuilder {
+    nodes: Vec<NumaNode>,
+    sources: Vec<Source>,
+}
+
+impl DrainerBuilder {
+    /// Enumerate the machine's NUMA topology; no rings exist yet.
+    pub fn new() -> Self {
+        let nodes = numa_nodes();
+        info!(
+            "draining {} NUMA node ring buffer(s) ({} total)",
+            nodes.len(),
+            nodes.iter().map(|n| n.id).max().map_or(0, |m| m + 1)
+        );
+        Self {
+            nodes,
+            sources: Vec::new(),
+        }
+    }
+
+    /// Create one NUMA-placed ring buffer per online node for a feature, insert
+    /// each into the feature's outer `ARRAY_OF_MAPS`, and record `cb` as the
+    /// decode callback for those rings. `name` names the inner rings (visible in
+    /// `bpftool map list`).
+    ///
+    /// Must be called **before** the feature's eBPF programs are attached, so
+    /// events always find a populated ring for their node.
+    pub fn register(&mut self, name: &str, outer: &impl MapCore, cb: RingCallback) -> Result<()> {
+        let mut rings = Vec::with_capacity(self.nodes.len());
+        for node in &self.nodes {
+            // The rings' pages are placed on the node so its CPUs reserve locally.
+            let ring = create_node_ringbuf(name, node.id)?;
+            insert_ring(outer, node.id, &ring)?;
+            rings.push(ring);
+        }
+        self.sources.push(Source { rings, cb });
+        Ok(())
+    }
+
+    /// Spawn one pinned draining thread per node, each polling every registered
+    /// feature's ring for that node. With nothing registered (no event-driven
+    /// feature enabled) no threads are spawned.
+    pub fn start(self) -> Result<Drainers> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut threads = Vec::with_capacity(self.nodes.len());
+
+        // Regroup the per-source ring columns into one row per node.
+        let mut per_node: Vec<Vec<(MapHandle, RingCallback)>> =
+            self.nodes.iter().map(|_| Vec::new()).collect();
+        for source in self.sources {
+            for (slot, ring) in per_node.iter_mut().zip(source.rings) {
+                slot.push((ring, Arc::clone(&source.cb)));
+            }
+        }
+
+        for (node, rings) in self.nodes.into_iter().zip(per_node) {
+            if rings.is_empty() {
+                continue;
+            }
+            let stop = Arc::clone(&stop);
+            let id = node.id;
+            let thread = std::thread::Builder::new()
+                .name(format!("drain-node{id}"))
+                .spawn(move || drain_node(id, &node.cpus, rings, &stop))?;
+            threads.push(thread);
+        }
+
+        Ok(Drainers { stop, threads })
+    }
 }
 
 /// Handle to the spawned per-node draining threads; [`shutdown`](Self::shutdown)
@@ -77,59 +165,15 @@ pub struct Drainers {
 }
 
 impl Drainers {
-    /// Signal the draining threads to stop and join them. Their channel senders
-    /// drop as they exit, closing the channel so the record task ends too.
+    /// Signal the draining threads to stop and join them. Any channel senders
+    /// captured by the feature callbacks drop as the threads exit, closing the
+    /// features' record channels so their record tasks end too.
     pub fn shutdown(self) {
         self.stop.store(true, Ordering::Relaxed);
         for thread in self.threads {
             let _ = thread.join();
         }
     }
-}
-
-/// Create one NUMA-placed ring buffer per online node for both features, insert
-/// each into the matching outer `ARRAY_OF_MAPS`, and spawn a pinned draining
-/// thread per node. Returns the receiving end of the event channel plus a
-/// [`Drainers`] handle for shutdown.
-///
-/// Must be called **before** the eBPF programs are attached, so events always
-/// find a populated ring for their node.
-pub fn setup(
-    io_outer: &impl MapCore,
-    meta_outer: &impl MapCore,
-    dropped: Arc<AtomicU64>,
-) -> Result<(mpsc::Receiver<RawEvent>, Drainers)> {
-    let nodes = numa_nodes();
-    info!(
-        "draining {} NUMA node ring buffer(s) ({} total)",
-        nodes.len(),
-        nodes.iter().map(|n| n.id).max().map_or(0, |m| m + 1)
-    );
-
-    let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-    let stop = Arc::new(AtomicBool::new(false));
-    let mut threads = Vec::with_capacity(nodes.len());
-
-    for node in nodes {
-        // Create and insert this node's rings while the outer maps are in hand;
-        // the rings' pages are placed on the node so its CPUs reserve locally.
-        let io_ring = create_node_ringbuf("io_events_node", node.id)?;
-        let meta_ring = create_node_ringbuf("meta_events_node", node.id)?;
-        insert_ring(io_outer, node.id, &io_ring)?;
-        insert_ring(meta_outer, node.id, &meta_ring)?;
-
-        let tx = tx.clone();
-        let stop = Arc::clone(&stop);
-        let dropped = Arc::clone(&dropped);
-        let cpus = node.cpus;
-        let id = node.id;
-        let thread = std::thread::Builder::new()
-            .name(format!("drain-node{id}"))
-            .spawn(move || drain_node(id, &cpus, io_ring, meta_ring, tx, &stop, &dropped))?;
-        threads.push(thread);
-    }
-
-    Ok((rx, Drainers { stop, threads }))
 }
 
 /// Create a ring buffer placed on NUMA node `node`, matching the inner-map
@@ -164,53 +208,22 @@ fn insert_ring(outer: &impl MapCore, node: u32, ring: &MapHandle) -> Result<()> 
 }
 
 /// Body of a per-node draining thread: pin to the node's CPUs, then poll the
-/// node's two rings forwarding decoded events until signalled to stop. Owns the
-/// ring handles for its lifetime (the kernel keeps the rings alive via the outer
-/// array regardless).
-fn drain_node(
-    id: u32,
-    cpus: &[usize],
-    io_ring: MapHandle,
-    meta_ring: MapHandle,
-    tx: mpsc::Sender<RawEvent>,
-    stop: &AtomicBool,
-    dropped: &AtomicU64,
-) {
+/// node's rings, running each feature's decode callback, until signalled to
+/// stop. Owns the ring handles for its lifetime (the kernel keeps the rings
+/// alive via the outer arrays regardless).
+fn drain_node(id: u32, cpus: &[usize], rings: Vec<(MapHandle, RingCallback)>, stop: &AtomicBool) {
     pin_to_cpus(id, cpus);
 
     let mut builder = RingBufferBuilder::new();
-    let io_cb = {
-        let tx = tx.clone();
-        move |data: &[u8]| {
-            if data.len() >= size_of::<IOEvent>() {
-                // Safety: the BPF program wrote an IOEvent here; the length
-                // check guards the read and we read unaligned (the slice has no
-                // alignment guarantee).
-                let event = unsafe { (data.as_ptr() as *const IOEvent).read_unaligned() };
-                if tx.try_send(RawEvent::Io(event)).is_err() {
-                    dropped.fetch_add(1, Ordering::Relaxed);
-                }
-            }
+    for (ring, cb) in &rings {
+        let cb = Arc::clone(cb);
+        if let Err(e) = builder.add(ring, move |data: &[u8]| {
+            cb(data);
             0
+        }) {
+            error!("node {id}: failed to register ring buffer: {e}");
+            return;
         }
-    };
-    let meta_cb = move |data: &[u8]| {
-        if data.len() >= size_of::<MetadataEvent>() {
-            // Safety: as above, for a MetadataEvent.
-            let event = unsafe { (data.as_ptr() as *const MetadataEvent).read_unaligned() };
-            if tx.try_send(RawEvent::Meta(event)).is_err() {
-                dropped.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        0
-    };
-
-    if let Err(e) = builder
-        .add(&io_ring, io_cb)
-        .and_then(|b| b.add(&meta_ring, meta_cb))
-    {
-        error!("node {id}: failed to register ring buffers: {e}");
-        return;
     }
     let ring_buffer = match builder.build() {
         Ok(rb) => rb,
@@ -222,7 +235,7 @@ fn drain_node(
 
     while !stop.load(Ordering::Relaxed) {
         // Negative return is an error (e.g. EINTR); keep polling. A closed
-        // channel is handled by try_send above, not here.
+        // channel is the feature callback's business, not ours.
         let _ = ring_buffer.poll_raw(POLL_TIMEOUT);
     }
 }
