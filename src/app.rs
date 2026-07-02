@@ -21,17 +21,23 @@ use log::info;
 use tokio::io::unix::AsyncFd;
 use tokio::signal;
 
-use crate::bindings::UnwindMiss;
+use crate::bindings::{IOEvent, MetadataEvent, UnwindMiss};
 use crate::bpf::{self, ExporterSkelBuilder};
 use crate::cgroup::{CgroupMode, CgroupRegistry};
 use crate::metrics::{self, IoMetrics, MetadataMetrics};
-use crate::numa::{self, RawEvent};
+use crate::numa::{self, decode_event};
 use crate::profiling::Profiler;
 use crate::telemetry;
 
 /// How often dead cgroups are reaped and every feature's per-cgroup state is
 /// pruned (and the profiler services unwind misses / evicts dead processes).
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Bound on each feature's channel buffering decoded events between the
+/// per-node draining threads and that feature's record task. On overflow events
+/// are dropped (and counted per feature) rather than blocking the draining
+/// thread — the same drop-on-full behaviour the kernel ring buffer already has.
+const CHANNEL_CAPACITY: usize = 1 << 16;
 
 /// A telemetry signal the exporter can collect, selected via `--signals`. Each
 /// maps to a feature: an eBPF program set that is attached (or not) and the
@@ -210,17 +216,58 @@ async fn run_async(args: Args) -> Result<()> {
         return Ok(());
     }
 
-    // Per-NUMA-node event ring buffers. Created and inserted into the outer
-    // ARRAY_OF_MAPS *before* attaching, so every event finds a populated ring
-    // for its node; the draining threads start now and buffer into the channel
-    // until the record task (spawned below) drains it. Counts events dropped on
-    // channel overflow.
-    let dropped_events = Arc::new(AtomicU64::new(0));
-    let (mut event_rx, drainers) = numa::setup(
-        &skel.maps.EVENTS,
-        &skel.maps.METADATA_EVENTS,
-        Arc::clone(&dropped_events),
-    )?;
+    // Per-NUMA-node event ring buffers, one set per enabled event-driven
+    // feature. Each feature registers its outer ARRAY_OF_MAPS with a callback
+    // that decodes its event type and forwards it down the feature's own
+    // bounded channel (dropping + counting on overflow); the rings are created
+    // and inserted *before* attaching, so every event finds a ring for its
+    // node. The per-node draining threads start once every feature has
+    // registered, and buffer into the channels until the record tasks (spawned
+    // below) drain them.
+    let mut drainer = numa::DrainerBuilder::new();
+    let mut drop_counters: Vec<(&'static str, Arc<AtomicU64>)> = Vec::new();
+
+    let io_rx = io_enabled
+        .then(|| {
+            let (tx, rx) = tokio::sync::mpsc::channel::<IOEvent>(CHANNEL_CAPACITY);
+            let dropped = Arc::new(AtomicU64::new(0));
+            drop_counters.push(("io", Arc::clone(&dropped)));
+            drainer.register(
+                "io_events_node",
+                &skel.maps.EVENTS,
+                Arc::new(move |data| {
+                    if let Some(event) = decode_event::<IOEvent>(data)
+                        && tx.try_send(event).is_err()
+                    {
+                        dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                }),
+            )?;
+            Ok::<_, anyhow::Error>(rx)
+        })
+        .transpose()?;
+
+    let meta_rx = metadata_enabled
+        .then(|| {
+            let (tx, rx) = tokio::sync::mpsc::channel::<MetadataEvent>(CHANNEL_CAPACITY);
+            let dropped = Arc::new(AtomicU64::new(0));
+            drop_counters.push(("vfs_metadata", Arc::clone(&dropped)));
+            drainer.register(
+                "meta_events_node",
+                &skel.maps.METADATA_EVENTS,
+                Arc::new(move |data| {
+                    if let Some(event) = decode_event::<MetadataEvent>(data)
+                        && tx.try_send(event).is_err()
+                    {
+                        dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                }),
+            )?;
+            Ok::<_, anyhow::Error>(rx)
+        })
+        .transpose()?;
+
+    let drainers = drainer.start()?;
 
     // Attach all auto-attachable programs now that their rings are wired up.
     skel.attach()?;
@@ -282,39 +329,33 @@ async fn run_async(args: Args) -> Result<()> {
     // `.await`.
     let profiler = profiler.map(|p| Arc::new(tokio::sync::Mutex::new(p)));
 
-    // IO + metadata events arrive via the per-NUMA-node draining threads (see
-    // `numa::setup` above) over `event_rx`; one task drains the channel and runs
-    // the async `record` path, serially as the single consume loop did before.
-    let record_task = tokio::spawn({
-        let io_metrics = io_metrics.clone();
-        let metadata_metrics = metadata_metrics.clone();
-        async move {
+    // Events arrive via the per-NUMA-node draining threads (see the drainer
+    // registration above) over each feature's channel; one task per feature
+    // drains its channel and runs the async `record` path, serially as the
+    // single consume loop did before.
+    let mut record_tasks = Vec::new();
+    if let (Some(mut rx), Some(m)) = (io_rx, io_metrics.clone()) {
+        record_tasks.push(tokio::spawn(async move {
             // Drain in batches to amortize the per-event await overhead.
             let mut batch = Vec::with_capacity(1024);
-            loop {
-                let n = event_rx.recv_many(&mut batch, 1024).await;
-                if n == 0 {
-                    break; // all draining threads have stopped
-                }
+            // recv_many returning 0 means all draining threads have stopped.
+            while rx.recv_many(&mut batch, 1024).await > 0 {
                 for event in batch.drain(..) {
-                    // The matching program set is only attached when its signal is
-                    // enabled, so the `None` arm never actually fires; guard anyway.
-                    match event {
-                        RawEvent::Io(e) => {
-                            if let Some(m) = &io_metrics {
-                                m.record(&e).await;
-                            }
-                        }
-                        RawEvent::Meta(e) => {
-                            if let Some(m) = &metadata_metrics {
-                                m.record(&e).await;
-                            }
-                        }
-                    }
+                    m.record(&event).await;
                 }
             }
-        }
-    });
+        }));
+    }
+    if let (Some(mut rx), Some(m)) = (meta_rx, metadata_metrics.clone()) {
+        record_tasks.push(tokio::spawn(async move {
+            let mut batch = Vec::with_capacity(1024);
+            while rx.recv_many(&mut batch, 1024).await > 0 {
+                for event in batch.drain(..) {
+                    m.record(&event).await;
+                }
+            }
+        }));
+    }
 
     // Unwind-miss ring buffer (a single global ring — low volume, only written
     // when profiling is on). Drained on the tokio runtime via its epoll fd; when
@@ -322,10 +363,7 @@ async fn run_async(args: Args) -> Result<()> {
     let misses_ringbuf = if let Some(misses) = miss_sink {
         let mut rb_builder = RingBufferBuilder::new();
         rb_builder.add(&skel.maps.UNWIND_MISSES, move |data: &[u8]| {
-            if data.len() >= std::mem::size_of::<UnwindMiss>() {
-                // Safety: the BPF program writes a UnwindMiss into this ring buffer;
-                // read unaligned since the slice has no alignment guarantee.
-                let miss = unsafe { (data.as_ptr() as *const UnwindMiss).read_unaligned() };
+            if let Some(miss) = decode_event::<UnwindMiss>(data) {
                 misses.lock().unwrap().insert(miss.tgid, miss.cgroup_id);
             }
             0
@@ -353,7 +391,6 @@ async fn run_async(args: Args) -> Result<()> {
     // overflow count, so a record loop that can't keep up is visible.
     let metrics_task = tokio::spawn({
         let registry = Arc::clone(&registry);
-        let dropped_events = Arc::clone(&dropped_events);
         let mut interval =
             tokio::time::interval(Duration::from_secs(args.metrics_interval_secs.max(1)));
         async move {
@@ -362,9 +399,13 @@ async fn run_async(args: Args) -> Result<()> {
                 // Returns immediately after spawning one export task per cgroup, so a
                 // slow export never delays the next tick.
                 registry.collect_and_export_all();
-                let dropped = dropped_events.swap(0, Ordering::Relaxed);
-                if dropped > 0 {
-                    log::warn!("dropped {dropped} events: record loop fell behind");
+                for (feature, dropped) in &drop_counters {
+                    let dropped = dropped.swap(0, Ordering::Relaxed);
+                    if dropped > 0 {
+                        log::warn!(
+                            "{feature}: dropped {dropped} events: record loop fell behind"
+                        );
+                    }
                 }
             }
         }
@@ -447,7 +488,9 @@ async fn run_async(args: Args) -> Result<()> {
     // fd-dup'd MapHandles (independent of the skel), so aborting is clean.
     metrics_task.abort();
     cleanup_task.abort();
-    record_task.abort();
+    for record_task in record_tasks {
+        record_task.abort();
+    }
     if let Some(profile_task) = profile_task {
         profile_task.abort();
     }
