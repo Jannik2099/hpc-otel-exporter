@@ -1,8 +1,8 @@
-#[cfg(feature = "mimalloc")]
-use mimalloc::MiMalloc;
-#[cfg(feature = "mimalloc")]
+#[cfg(feature = "tcmalloc")]
+use tcmalloc_better::TCMalloc;
+#[cfg(feature = "tcmalloc")]
 #[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+static GLOBAL: TCMalloc = TCMalloc;
 
 use anyhow::Result;
 use clap::Parser;
@@ -20,6 +20,9 @@ mod self_profile;
 mod telemetry;
 
 fn main() -> Result<()> {
+    #[cfg(feature = "tcmalloc")]
+    TCMalloc::process_background_actions_thread();
+
     let args = app::Args::parse();
 
     app::run(args)
