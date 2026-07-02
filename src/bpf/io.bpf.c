@@ -1,5 +1,8 @@
 // IO tracing: records the size and duration of synchronous vfs_read/vfs_write,
 // grouped by cgroup, into the EVENTS ring buffer.
+//
+// A standalone BPF object (one per signal): loaded, verified and its maps
+// created only when the io_requests signal is enabled.
 
 #include "io.h"
 
@@ -10,6 +13,8 @@
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
+
+char LICENSE[] SEC("license") = "GPL";
 
 // Per-task start timestamp of the in-flight read/write, stashed at entry and
 // consumed at exit to compute the operation's duration.
