@@ -260,16 +260,17 @@ impl IoCollector {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<IOEvent>(CHANNEL_CAPACITY);
         let dropped = Arc::new(AtomicU64::new(0));
-        ctx.drainer.register("io_events_node", &skel.maps.EVENTS, {
-            let dropped = Arc::clone(&dropped);
-            Arc::new(move |data| {
-                if let Some(event) = decode_event::<IOEvent>(data)
-                    && tx.try_send(event).is_err()
-                {
-                    dropped.fetch_add(1, Ordering::Relaxed);
-                }
-            })
-        })?;
+        ctx.drainer
+            .register("io_events_node", &skel.maps.IO_EVENTS, {
+                let dropped = Arc::clone(&dropped);
+                Arc::new(move |data| {
+                    if let Some(event) = decode_event::<IOEvent>(data)
+                        && tx.try_send(event).is_err()
+                    {
+                        dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })?;
 
         let metrics = Arc::new(IoMetrics::new(Arc::clone(&ctx.registry)));
         let record_task = tokio::spawn({
