@@ -16,7 +16,7 @@ use clap::Parser;
 use log::info;
 use tokio::signal;
 
-use crate::cgroup::{CgroupMode, CgroupRegistry};
+use crate::cgroup::{CgroupMode, CgroupRegistry, CgroupView};
 use crate::collector::{BuildCtx, Collector};
 use crate::metrics::{self, IoCollector, MetadataCollector};
 use crate::numa;
@@ -30,6 +30,10 @@ const CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
 /// A telemetry signal the exporter can collect, selected via `--signals`. Each
 /// maps to a [`Collector`]: its own eBPF object plus the userspace half that
 /// records it. With none given on the CLI, all are enabled.
+///
+/// This enum is the single per-signal list: adding a signal means adding a
+/// variant plus its [`views`](Self::views) / [`build`](Self::build) arms (and
+/// the eBPF object in `build.rs`'s `BPF_SRCS`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum Signal {
     /// VFS metadata-operation duration metrics.
@@ -41,6 +45,37 @@ enum Signal {
     /// CPU profiles sampled via perf_event.
     #[value(name = "cpu_profiles")]
     CpuProfiles,
+}
+
+impl Signal {
+    /// Every signal, in construction order.
+    const ALL: [Signal; 3] = [Signal::VfsMetadata, Signal::IoRequests, Signal::CpuProfiles];
+
+    /// The metric views this signal contributes to every per-cgroup meter
+    /// provider (registered at registry build time, before any collector runs).
+    fn views(self) -> Vec<CgroupView> {
+        match self {
+            Signal::VfsMetadata => metrics::metadata::histogram_views(),
+            Signal::IoRequests => metrics::io::histogram_views(),
+            Signal::CpuProfiles => Vec::new(),
+        }
+    }
+
+    /// Construct the signal's collector: open + load its eBPF object, register
+    /// its rings with the shared drainer, and spawn its tasks (see
+    /// [`crate::collector`] for the lifecycle).
+    fn build(self, ctx: &mut BuildCtx, args: &Args) -> Result<Box<dyn Collector>> {
+        Ok(match self {
+            Signal::VfsMetadata => Box::new(MetadataCollector::new(ctx)?),
+            Signal::IoRequests => Box::new(IoCollector::new(ctx)?),
+            Signal::CpuProfiles => Box::new(CpuProfileCollector::new(
+                ctx,
+                args.pyroscope_url.clone(),
+                args.profile_frequency,
+                args.profile_interval_secs,
+            )?),
+        })
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -134,12 +169,12 @@ async fn run_async(args: Args) -> Result<()> {
     let filters = crate::cgroup_filter::parse_filters(&args.cgroup_filters)
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    // Which signals to collect. With none given on the CLI, enable all of them;
-    // otherwise each feature is gated on being named in `--signals`.
-    let all_signals = args.signals.is_empty();
-    let metadata_enabled = all_signals || args.signals.contains(&Signal::VfsMetadata);
-    let io_enabled = all_signals || args.signals.contains(&Signal::IoRequests);
-    let profiling_enabled = all_signals || args.signals.contains(&Signal::CpuProfiles);
+    // Which signals to collect. With none given on the CLI, enable all of
+    // them; walking `ALL` also dedups a repeated CLI value.
+    let enabled: Vec<Signal> = Signal::ALL
+        .into_iter()
+        .filter(|s| args.signals.is_empty() || args.signals.contains(s))
+        .collect();
 
     // Optional self-profiling of the exporter itself (separate from the target
     // profiling in `profiling`); kept alive for the process' lifetime.
@@ -169,10 +204,9 @@ async fn run_async(args: Args) -> Result<()> {
     let _tracing_guard = telemetry::init_tracing();
 
     // Single owner of per-cgroup meter providers and cgroup liveness, shared by
-    // every collector. IO and metadata each contribute their histogram
+    // every collector. Each enabled signal contributes its histogram
     // aggregation views.
-    let mut histogram_views = metrics::io::histogram_views();
-    histogram_views.extend(metrics::metadata::histogram_views());
+    let histogram_views = enabled.iter().flat_map(|s| s.views()).collect();
     let registry = Arc::new(CgroupRegistry::new(
         histogram_views,
         cgroup_mode,
@@ -192,19 +226,8 @@ async fn run_async(args: Args) -> Result<()> {
             v1_hierarchy_id,
             drainer: &mut drainer,
         };
-        if io_enabled {
-            collectors.push(Box::new(IoCollector::new(&mut ctx)?));
-        }
-        if metadata_enabled {
-            collectors.push(Box::new(MetadataCollector::new(&mut ctx)?));
-        }
-        if profiling_enabled {
-            collectors.push(Box::new(CpuProfileCollector::new(
-                &mut ctx,
-                args.pyroscope_url.clone(),
-                args.profile_frequency,
-                args.profile_interval_secs,
-            )?));
+        for signal in &enabled {
+            collectors.push(signal.build(&mut ctx, &args)?);
         }
     }
     info!("eBPF objects loaded!");
