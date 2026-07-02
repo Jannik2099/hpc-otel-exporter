@@ -5,8 +5,8 @@
 
 use std::ffi::CStr;
 
-use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider;
+use opentelemetry::{Key, KeyValue};
 use opentelemetry_appender_log::OpenTelemetryLogBridge;
 use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
 use opentelemetry_otlp::{
@@ -33,11 +33,21 @@ pub(crate) fn hostname() -> String {
 
 /// The OTel resource shared by every signal this process emits. `service.name` and
 /// any `OTEL_RESOURCE_ATTRIBUTES` are picked up from the environment by the default
-/// detectors; we add the node's hostname on top.
+/// detectors; we fall back to the node's hostname for `host.name` and
+/// `service.instance.id`, but only where the detectors didn't already set them.
+/// An explicit `OTEL_RESOURCE_ATTRIBUTES` value always wins.
 pub(crate) fn build_resource() -> Resource {
-    Resource::builder()
-        .with_attributes([KeyValue::new("host.name", hostname())])
-        .build()
+    let detected = Resource::builder().build();
+    let hostname = hostname();
+    let fallback = [
+        Key::from_static_str("host.name"),
+        Key::from_static_str("service.instance.id"),
+    ]
+    .into_iter()
+    .filter(|key| detected.get(key).is_none())
+    .map(|key| KeyValue::new(key, hostname.clone()));
+
+    Resource::builder().with_attributes(fallback).build()
 }
 
 /// TLS config for the OTLP/gRPC exporters. opentelemetry-otlp auto-enables TLS for
