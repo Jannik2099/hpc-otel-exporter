@@ -29,6 +29,8 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
+char LICENSE[] SEC("license") = "GPL";
+
 // A return value in [-MAX_ERRNO, -1], reinterpreted as an unsigned long, marks
 // an error (the kernel's IS_ERR_VALUE). Holds across int, ssize_t and
 // ERR_PTR/pointer-returning helpers (e.g. vfs_mkdir returns struct dentry *).
