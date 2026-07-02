@@ -22,7 +22,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::signal;
 
 use crate::bindings::{IOEvent, MetadataEvent, UnwindMiss};
-use crate::bpf::{self, ExporterSkelBuilder};
+use crate::bpf;
 use crate::cgroup::{CgroupMode, CgroupRegistry};
 use crate::metrics::{self, IoMetrics, MetadataMetrics};
 use crate::numa::{self, decode_event};
@@ -162,57 +162,78 @@ async fn run_async(args: Args) -> Result<()> {
     // Bump the memlock rlimit before loading (needed on older kernels).
     bpf::bump_memlock_rlimit();
 
-    // Open the BPF object (embedded in the binary).
-    let builder = ExporterSkelBuilder::default();
-    let mut open_object = MaybeUninit::uninit();
-    let mut open_skel = builder.open(&mut open_object)?;
-
-    // Select v1 vs v2 cgroup tracking before load: the eBPF side reads these
-    // rodata knobs (see src/bpf/cgroup_id.bpf.h) and the registry resolves the
-    // matching hierarchy. For v1 we pass the cpu,cpuacct hierarchy id so
-    // bpf_task_get_cgroup1 fetches the right cgroup.
-    let cgroup_mode = if args.use_cgroups_v1 {
+    // Select v1 vs v2 cgroup tracking before load: every signal object reads
+    // the same rodata knobs (see src/bpf/cgroup_id.bpf.h) and the registry
+    // resolves the matching hierarchy. For v1 we pass the cpu,cpuacct hierarchy
+    // id so bpf_task_get_cgroup1 fetches the right cgroup.
+    let (cgroup_mode, v1_hierarchy_id) = if args.use_cgroups_v1 {
         let hierarchy_id = detect_cpu_v1_hierarchy_id()
             .ok_or_else(|| anyhow::anyhow!("could not detect the cpu,cpuacct v1 hierarchy id"))?;
         info!("tracking cgroup v1 (cpu,cpuacct hierarchy id {hierarchy_id})");
-        let rodata = open_skel
-            .maps
-            .rodata_data
-            .as_deref_mut()
-            .expect("BPF .rodata section present");
-        rodata.USE_CGROUPS_V1 = true;
-        rodata.CGROUP_V1_HID = hierarchy_id;
-        CgroupMode::V1
+        (CgroupMode::V1, Some(hierarchy_id))
     } else {
-        CgroupMode::V2
+        (CgroupMode::V2, None)
     };
 
-    // The perf_event sampler needs a per-CPU perf fd, so it is attached by the
-    // profiler below; keep skel.attach() from trying to auto-attach it.
-    open_skel.progs.do_sample.set_autoattach(false);
-
-    // Suppress the eBPF programs behind any disabled signal so skel.attach()
-    // skips them: no probes on the kernel VFS paths whose events nobody consumes.
-    // The IO feature's programs are named `record_*`, the metadata feature's
-    // `meta_*` (the profiler's `do_sample` is already handled above).
-    if !io_enabled || !metadata_enabled {
-        for mut prog in open_skel.open_object_mut().progs_mut() {
-            let name = prog.name().to_string_lossy();
-            let disabled = (!io_enabled && name.starts_with("record_"))
-                || (!metadata_enabled && name.starts_with("meta_"));
-            if disabled {
-                prog.set_autoattach(false);
+    // Each signal is its own BPF object (embedded in the binary): only the
+    // enabled signals' objects are opened and loaded, so a disabled signal
+    // costs no verification and creates no maps. This macro opens one and
+    // stamps the shared cgroup-mode rodata knobs into it.
+    macro_rules! open_configured {
+        ($builder:ty, $storage:expr) => {{
+            let mut open_skel = <$builder>::default().open($storage)?;
+            if let Some(hid) = v1_hierarchy_id {
+                let rodata = open_skel
+                    .maps
+                    .rodata_data
+                    .as_deref_mut()
+                    .expect("BPF .rodata section present");
+                rodata.USE_CGROUPS_V1 = true;
+                rodata.CGROUP_V1_HID = hid;
             }
-        }
+            open_skel
+        }};
     }
 
-    let mut skel = open_skel.load()?;
+    let mut io_obj = MaybeUninit::uninit();
+    let mut io_skel = if io_enabled {
+        Some(open_configured!(bpf::io::IoSkelBuilder, &mut io_obj).load()?)
+    } else {
+        None
+    };
 
-    info!("eBPF program loaded!");
+    let mut metadata_obj = MaybeUninit::uninit();
+    let mut metadata_skel = if metadata_enabled {
+        Some(open_configured!(bpf::metadata::MetadataSkelBuilder, &mut metadata_obj).load()?)
+    } else {
+        None
+    };
+
+    let mut profiling_obj = MaybeUninit::uninit();
+    let mut profiling_skel = if profiling_enabled {
+        let mut open_skel =
+            open_configured!(bpf::profiling::ProfilingSkelBuilder, &mut profiling_obj);
+        // The perf_event sampler needs a per-CPU perf fd, so it is attached by
+        // the profiler below; keep skel.attach() from trying to auto-attach it.
+        open_skel.progs.do_sample.set_autoattach(false);
+        Some(open_skel.load()?)
+    } else {
+        None
+    };
+
+    info!("eBPF objects loaded!");
 
     if args.test_attach {
-        skel.attach()?;
-        info!("eBPF program attached!");
+        if let Some(skel) = &mut io_skel {
+            skel.attach()?;
+        }
+        if let Some(skel) = &mut metadata_skel {
+            skel.attach()?;
+        }
+        if let Some(skel) = &mut profiling_skel {
+            skel.attach()?;
+        }
+        info!("eBPF programs attached!");
         return Ok(());
     }
 
@@ -227,8 +248,9 @@ async fn run_async(args: Args) -> Result<()> {
     let mut drainer = numa::DrainerBuilder::new();
     let mut drop_counters: Vec<(&'static str, Arc<AtomicU64>)> = Vec::new();
 
-    let io_rx = io_enabled
-        .then(|| {
+    let io_rx = io_skel
+        .as_ref()
+        .map(|skel| {
             let (tx, rx) = tokio::sync::mpsc::channel::<IOEvent>(CHANNEL_CAPACITY);
             let dropped = Arc::new(AtomicU64::new(0));
             drop_counters.push(("io", Arc::clone(&dropped)));
@@ -247,8 +269,9 @@ async fn run_async(args: Args) -> Result<()> {
         })
         .transpose()?;
 
-    let meta_rx = metadata_enabled
-        .then(|| {
+    let meta_rx = metadata_skel
+        .as_ref()
+        .map(|skel| {
             let (tx, rx) = tokio::sync::mpsc::channel::<MetadataEvent>(CHANNEL_CAPACITY);
             let dropped = Arc::new(AtomicU64::new(0));
             drop_counters.push(("vfs_metadata", Arc::clone(&dropped)));
@@ -269,9 +292,17 @@ async fn run_async(args: Args) -> Result<()> {
 
     let drainers = drainer.start()?;
 
-    // Attach all auto-attachable programs now that their rings are wired up.
-    skel.attach()?;
-    info!("eBPF program attached!");
+    // Attach the enabled signals' programs now that their rings are wired up.
+    if let Some(skel) = &mut io_skel {
+        skel.attach()?;
+    }
+    if let Some(skel) = &mut metadata_skel {
+        skel.attach()?;
+    }
+    if let Some(skel) = &mut profiling_skel {
+        skel.attach()?;
+    }
+    info!("eBPF programs attached!");
 
     // Install the global tracer provider (OTLP/gRPC), kept alive for the whole run
     // so buffered spans flush on exit. The demand-driven unwind loader and
@@ -307,7 +338,7 @@ async fn run_async(args: Args) -> Result<()> {
             Arc::clone(&registry),
         )
     });
-    if let Some(profiler) = &mut profiler {
+    if let (Some(profiler), Some(skel)) = (&mut profiler, &profiling_skel) {
         profiler.attach(&skel.progs.do_sample, args.profile_frequency)?;
     }
 
@@ -315,14 +346,29 @@ async fn run_async(args: Args) -> Result<()> {
     // writes into; grab it now, before the profiler is moved behind its own mutex.
     let miss_sink = profiler.as_ref().map(|p| p.miss_sink());
 
-    // Owned, fd-dup'd handles to the maps the periodic tasks touch. `MapHandle` is
-    // `Send + Sync + 'static` (unlike the skel-borrowed `Map`), so it can move into
-    // independently spawned tasks without tying them to the skel's lifetime.
-    let unwind_rows = MapHandle::try_from(&skel.maps.UNWIND_ROWS)?;
-    let executables = MapHandle::try_from(&skel.maps.EXECUTABLES)?;
-    let proc_mappings = MapHandle::try_from(&skel.maps.PROC_MAPPINGS)?;
-    let stack_counts = MapHandle::try_from(&skel.maps.STACK_COUNTS)?;
-    let stacks = MapHandle::try_from(&skel.maps.STACKS)?;
+    // Owned, fd-dup'd handles to the profiling maps the periodic tasks touch.
+    // `MapHandle` is `Send + Sync + 'static` (unlike the skel-borrowed `Map`), so
+    // it can move into independently spawned tasks without tying them to the
+    // skel's lifetime. Present exactly when the profiler is.
+    let prof_cleanup_maps = profiling_skel
+        .as_ref()
+        .map(|skel| -> Result<_> {
+            Ok((
+                MapHandle::try_from(&skel.maps.UNWIND_ROWS)?,
+                MapHandle::try_from(&skel.maps.EXECUTABLES)?,
+                MapHandle::try_from(&skel.maps.PROC_MAPPINGS)?,
+            ))
+        })
+        .transpose()?;
+    let prof_drain_maps = profiling_skel
+        .as_ref()
+        .map(|skel| -> Result<_> {
+            Ok((
+                MapHandle::try_from(&skel.maps.STACK_COUNTS)?,
+                MapHandle::try_from(&skel.maps.STACKS)?,
+            ))
+        })
+        .transpose()?;
 
     // Share the profiler between the cleanup task (needs `&mut` for `on_cleanup`)
     // and the profile task; an async mutex because both hold the guard across
@@ -357,10 +403,10 @@ async fn run_async(args: Args) -> Result<()> {
         }));
     }
 
-    // Unwind-miss ring buffer (a single global ring — low volume, only written
+    // Unwind-miss ring buffer (a single global ring — low volume, only exists
     // when profiling is on). Drained on the tokio runtime via its epoll fd; when
     // profiling is off there is no ring and the main loop just waits for Ctrl-C.
-    let misses_ringbuf = if let Some(misses) = miss_sink {
+    let misses_ringbuf = if let (Some(misses), Some(skel)) = (miss_sink, &profiling_skel) {
         let mut rb_builder = RingBufferBuilder::new();
         rb_builder.add(&skel.maps.UNWIND_MISSES, move |data: &[u8]| {
             if let Some(miss) = decode_event::<UnwindMiss>(data) {
@@ -429,10 +475,12 @@ async fn run_async(args: Args) -> Result<()> {
                 if let Some(m) = &metadata_metrics {
                     m.retain_live(&live);
                 }
-                if let Some(profiler) = &profiler {
+                if let (Some(profiler), Some((unwind_rows, executables, proc_mappings))) =
+                    (&profiler, &prof_cleanup_maps)
+                {
                     let mut profiler = profiler.lock().await;
                     profiler
-                        .on_cleanup(&live, &unwind_rows, &executables, &proc_mappings)
+                        .on_cleanup(&live, unwind_rows, executables, proc_mappings)
                         .await;
                 }
             }
@@ -440,21 +488,24 @@ async fn run_async(args: Args) -> Result<()> {
     });
 
     // CPU profile drain + push, only when profiling is enabled.
-    let profile_task = profiler.as_ref().map(|profiler| {
-        let profiler = Arc::clone(profiler);
-        let mut interval =
-            tokio::time::interval(Duration::from_secs(args.profile_interval_secs.max(1)));
-        tokio::spawn(async move {
-            loop {
-                interval.tick().await;
-                profiler
-                    .lock()
-                    .await
-                    .collect_and_push(&stack_counts, &stacks)
-                    .await;
-            }
-        })
-    });
+    let profile_task = profiler
+        .as_ref()
+        .zip(prof_drain_maps)
+        .map(|(profiler, (stack_counts, stacks))| {
+            let profiler = Arc::clone(profiler);
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(args.profile_interval_secs.max(1)));
+            tokio::spawn(async move {
+                loop {
+                    interval.tick().await;
+                    profiler
+                        .lock()
+                        .await
+                        .collect_and_push(&stack_counts, &stacks)
+                        .await;
+                }
+            })
+        });
 
     loop {
         match (&misses_fd, &misses_ringbuf) {
