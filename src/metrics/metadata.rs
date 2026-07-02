@@ -203,8 +203,10 @@ impl MetadataCollector {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<MetadataEvent>(CHANNEL_CAPACITY);
         let dropped = Arc::new(AtomicU64::new(0));
-        ctx.drainer
-            .register("meta_events_node", &skel.maps.METADATA_EVENTS, {
+        ctx.drainer.register(
+            "vfs_metadata_events_node",
+            &skel.maps.VFS_METADATA_EVENTS,
+            {
                 let dropped = Arc::clone(&dropped);
                 Arc::new(move |data| {
                     if let Some(event) = decode_event::<MetadataEvent>(data)
@@ -213,7 +215,8 @@ impl MetadataCollector {
                         dropped.fetch_add(1, Ordering::Relaxed);
                     }
                 })
-            })?;
+            },
+        )?;
 
         let metrics = Arc::new(MetadataMetrics::new(Arc::clone(&ctx.registry)));
         let record_task = tokio::spawn({
