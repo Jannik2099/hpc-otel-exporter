@@ -28,7 +28,7 @@ struct {
 // Completed IO operations (struct IOEvent), drained by userspace IO metrics.
 // One ring buffer per NUMA node (see numa_ringbuf.bpf.h); the recording CPU
 // reserves in its local node's ring.
-DEFINE_NUMA_RINGBUF(EVENTS);
+DEFINE_NUMA_RINGBUF(IO_EVENTS);
 
 static __always_inline s32 file_to_mount_id(const struct file *file) {
     const struct vfsmount *vfsmount = file->f_path.mnt;
@@ -71,7 +71,7 @@ static __always_inline void record_end(const struct file *file, const s64 bytes,
     }
 
     struct IOEvent *const event =
-        numa_ringbuf_reserve(&EVENTS, sizeof(struct IOEvent));
+        numa_ringbuf_reserve(&IO_EVENTS, sizeof(struct IOEvent));
     if (event == NULL) {
         return;
     }
