@@ -12,6 +12,7 @@ mod bindings;
 mod bpf;
 mod cgroup;
 mod cgroup_filter;
+mod collector;
 mod metrics;
 mod numa;
 mod profiling;

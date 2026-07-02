@@ -16,5 +16,5 @@
 pub mod io;
 pub mod metadata;
 
-pub use io::IoMetrics;
-pub use metadata::MetadataMetrics;
+pub use io::IoCollector;
+pub use metadata::MetadataCollector;
