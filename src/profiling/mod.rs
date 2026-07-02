@@ -86,9 +86,10 @@ impl CgroupSamples {
 }
 
 /// The CPU profiler: drains the in-kernel stack aggregation, symbolizes, and
-/// pushes per-cgroup pprof profiles to Pyroscope. Also owns the native unwinder's
-/// userspace half (the [`UnwindLoader`]) and the perf sampler, so the event loop
-/// only deals with the facade.
+/// pushes per-cgroup pprof profiles to Pyroscope. Also owns the native
+/// unwinder's userspace half (the [`UnwindLoader`]) and the profiling map
+/// handles, so [`CpuProfileCollector`] only deals with the facade (the perf
+/// sampler guard lives in the collector, which starts/stops sampling).
 pub struct Profiler {
     pusher: Pusher,
     /// Wall-clock nanoseconds each sample represents (`1e9 / freq`).
@@ -520,8 +521,7 @@ impl CpuProfileCollector {
         // empty maps.
         let profile_task = tokio::spawn({
             let profiler = Arc::clone(&profiler);
-            let mut interval =
-                tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
+            let mut interval = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
             async move {
                 loop {
                     interval.tick().await;

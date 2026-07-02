@@ -17,9 +17,7 @@ use rustc_hash::{FxBuildHasher, FxHashSet};
 use crate::bindings::{self, FsMagic, IOEvent};
 use crate::bpf;
 use crate::cgroup::{CgroupMeter, CgroupRegistry, CgroupView, PerCgroup};
-use crate::collector::{
-    BoxFuture, BuildCtx, CHANNEL_CAPACITY, Collector, configure_cgroup_rodata,
-};
+use crate::collector::{BoxFuture, BuildCtx, CHANNEL_CAPACITY, Collector, configure_cgroup_rodata};
 use crate::numa::decode_event;
 
 impl FsMagic {
