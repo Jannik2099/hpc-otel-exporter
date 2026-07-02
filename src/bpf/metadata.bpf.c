@@ -72,7 +72,7 @@ struct {
 // Completed VFS metadata operations (struct MetadataEvent), drained by
 // userspace metadata metrics. One ring buffer per NUMA node (see
 // numa_ringbuf.bpf.h); the recording CPU reserves in its local node's ring.
-DEFINE_NUMA_RINGBUF(METADATA_EVENTS);
+DEFINE_NUMA_RINGBUF(VFS_METADATA_EVENTS);
 
 static __always_inline void meta_start(const enum MetadataOp op,
                                        const struct dentry *dentry) {
@@ -124,8 +124,8 @@ static __always_inline void meta_end(const enum MetadataOp op, void *ctx) {
     u64 ret = 0;
     bpf_get_func_ret(ctx, &ret);
 
-    struct MetadataEvent *const event =
-        numa_ringbuf_reserve(&METADATA_EVENTS, sizeof(struct MetadataEvent));
+    struct MetadataEvent *const event = numa_ringbuf_reserve(
+        &VFS_METADATA_EVENTS, sizeof(struct MetadataEvent));
     if (event == NULL) {
         return;
     }
