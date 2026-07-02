@@ -62,17 +62,17 @@ object = { version = "0.39", default-features = false, features = [
 memmap2 = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-mimalloc = { version = "0.1.52", optional = true }
+tcmalloc-better = { version = "0.1.19", optional = true }
 nix = { version = "0.31.3", features = ["user"], default-features = false }
 
 [patch.crates-io]
 gimli = { git = "https://github.com/Jannik2099/gimli.git", rev = "da55014d4d616ffe438f8abf834e9b0c8fcf8a44" }
 
 [features]
-default = ["mimalloc"]
+default = ["tcmalloc"]
 
 pyroscope = ["dep:pyroscope"]
-mimalloc = ["dep:mimalloc"]
+tcmalloc = ["dep:tcmalloc-better"]
 
 [build-dependencies]
 libbpf-cargo = "0.26.0"
