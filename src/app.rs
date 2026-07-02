@@ -1,53 +1,41 @@
-//! Application wiring and the main event loop.
+//! Application wiring: the feature-agnostic composition root.
 //!
-//! [`run`] loads the eBPF object, builds the shared [`CgroupRegistry`] and each
-//! telemetry feature, hooks their ringbuffer consumers, and then drives them from
-//! one `tokio::select!` loop. The loop stays feature-agnostic: ringbuffer events
-//! go to a feature's `record`/sink, and the two timers fan out to each feature's
-//! own `retain_live` / `on_cleanup` / `collect_and_push`, so adding a feature means
-//! constructing it and adding a line per tick — not growing the loop body.
+//! [`run`] builds the shared [`CgroupRegistry`], constructs one [`Collector`]
+//! per enabled signal (each owns its eBPF object, channels and tasks — see
+//! [`crate::collector`]), starts the per-NUMA-node draining threads, attaches
+//! everyone, and then only drives the two shared timers: the metrics-export
+//! tick (registry-owned) and the cleanup tick (fanned out to every collector's
+//! `on_cleanup`). Adding a signal means adding a [`Signal`] variant and its
+//! construction arm below — the loop body never grows.
 
-use std::mem::MaybeUninit;
-use std::os::fd::BorrowedFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
-use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
-use libbpf_rs::{MapHandle, RingBufferBuilder};
 use log::info;
-use tokio::io::unix::AsyncFd;
 use tokio::signal;
 
-use crate::bindings::{IOEvent, MetadataEvent, UnwindMiss};
-use crate::bpf;
 use crate::cgroup::{CgroupMode, CgroupRegistry};
-use crate::metrics::{self, IoMetrics, MetadataMetrics};
-use crate::numa::{self, decode_event};
-use crate::profiling::Profiler;
+use crate::collector::{BuildCtx, Collector};
+use crate::metrics::{self, IoCollector, MetadataCollector};
+use crate::numa;
+use crate::profiling::CpuProfileCollector;
 use crate::telemetry;
 
-/// How often dead cgroups are reaped and every feature's per-cgroup state is
+/// How often dead cgroups are reaped and every collector's per-cgroup state is
 /// pruned (and the profiler services unwind misses / evicts dead processes).
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Bound on each feature's channel buffering decoded events between the
-/// per-node draining threads and that feature's record task. On overflow events
-/// are dropped (and counted per feature) rather than blocking the draining
-/// thread — the same drop-on-full behaviour the kernel ring buffer already has.
-const CHANNEL_CAPACITY: usize = 1 << 16;
-
 /// A telemetry signal the exporter can collect, selected via `--signals`. Each
-/// maps to a feature: an eBPF program set that is attached (or not) and the
-/// userspace half that records it. With none given on the CLI, all are enabled.
+/// maps to a [`Collector`]: its own eBPF object plus the userspace half that
+/// records it. With none given on the CLI, all are enabled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum Signal {
-    /// VFS metadata-operation duration metrics (the `meta_*` eBPF programs).
+    /// VFS metadata-operation duration metrics.
     #[value(name = "vfs_metadata")]
     VfsMetadata,
-    /// VFS data read/write operation metrics (the `record_*` eBPF programs).
+    /// VFS data read/write operation metrics.
     #[value(name = "io_requests")]
     IoRequests,
     /// CPU profiles sampled via perf_event.
@@ -160,7 +148,7 @@ async fn run_async(args: Args) -> Result<()> {
         crate::self_profile::setup_pyroscope(&args.pyroscope_url, &telemetry::build_resource());
 
     // Bump the memlock rlimit before loading (needed on older kernels).
-    bpf::bump_memlock_rlimit();
+    crate::bpf::bump_memlock_rlimit();
 
     // Select v1 vs v2 cgroup tracking before load: every signal object reads
     // the same rodata knobs (see src/bpf/cgroup_id.bpf.h) and the registry
@@ -175,143 +163,14 @@ async fn run_async(args: Args) -> Result<()> {
         (CgroupMode::V2, None)
     };
 
-    // Each signal is its own BPF object (embedded in the binary): only the
-    // enabled signals' objects are opened and loaded, so a disabled signal
-    // costs no verification and creates no maps. This macro opens one and
-    // stamps the shared cgroup-mode rodata knobs into it.
-    macro_rules! open_configured {
-        ($builder:ty, $storage:expr) => {{
-            let mut open_skel = <$builder>::default().open($storage)?;
-            if let Some(hid) = v1_hierarchy_id {
-                let rodata = open_skel
-                    .maps
-                    .rodata_data
-                    .as_deref_mut()
-                    .expect("BPF .rodata section present");
-                rodata.USE_CGROUPS_V1 = true;
-                rodata.CGROUP_V1_HID = hid;
-            }
-            open_skel
-        }};
-    }
-
-    let mut io_obj = MaybeUninit::uninit();
-    let mut io_skel = if io_enabled {
-        Some(open_configured!(bpf::io::IoSkelBuilder, &mut io_obj).load()?)
-    } else {
-        None
-    };
-
-    let mut metadata_obj = MaybeUninit::uninit();
-    let mut metadata_skel = if metadata_enabled {
-        Some(open_configured!(bpf::metadata::MetadataSkelBuilder, &mut metadata_obj).load()?)
-    } else {
-        None
-    };
-
-    let mut profiling_obj = MaybeUninit::uninit();
-    let mut profiling_skel = if profiling_enabled {
-        let mut open_skel =
-            open_configured!(bpf::profiling::ProfilingSkelBuilder, &mut profiling_obj);
-        // The perf_event sampler needs a per-CPU perf fd, so it is attached by
-        // the profiler below; keep skel.attach() from trying to auto-attach it.
-        open_skel.progs.do_sample.set_autoattach(false);
-        Some(open_skel.load()?)
-    } else {
-        None
-    };
-
-    info!("eBPF objects loaded!");
-
-    if args.test_attach {
-        if let Some(skel) = &mut io_skel {
-            skel.attach()?;
-        }
-        if let Some(skel) = &mut metadata_skel {
-            skel.attach()?;
-        }
-        if let Some(skel) = &mut profiling_skel {
-            skel.attach()?;
-        }
-        info!("eBPF programs attached!");
-        return Ok(());
-    }
-
-    // Per-NUMA-node event ring buffers, one set per enabled event-driven
-    // feature. Each feature registers its outer ARRAY_OF_MAPS with a callback
-    // that decodes its event type and forwards it down the feature's own
-    // bounded channel (dropping + counting on overflow); the rings are created
-    // and inserted *before* attaching, so every event finds a ring for its
-    // node. The per-node draining threads start once every feature has
-    // registered, and buffer into the channels until the record tasks (spawned
-    // below) drain them.
-    let mut drainer = numa::DrainerBuilder::new();
-    let mut drop_counters: Vec<(&'static str, Arc<AtomicU64>)> = Vec::new();
-
-    let io_rx = io_skel
-        .as_ref()
-        .map(|skel| {
-            let (tx, rx) = tokio::sync::mpsc::channel::<IOEvent>(CHANNEL_CAPACITY);
-            let dropped = Arc::new(AtomicU64::new(0));
-            drop_counters.push(("io", Arc::clone(&dropped)));
-            drainer.register(
-                "io_events_node",
-                &skel.maps.EVENTS,
-                Arc::new(move |data| {
-                    if let Some(event) = decode_event::<IOEvent>(data)
-                        && tx.try_send(event).is_err()
-                    {
-                        dropped.fetch_add(1, Ordering::Relaxed);
-                    }
-                }),
-            )?;
-            Ok::<_, anyhow::Error>(rx)
-        })
-        .transpose()?;
-
-    let meta_rx = metadata_skel
-        .as_ref()
-        .map(|skel| {
-            let (tx, rx) = tokio::sync::mpsc::channel::<MetadataEvent>(CHANNEL_CAPACITY);
-            let dropped = Arc::new(AtomicU64::new(0));
-            drop_counters.push(("vfs_metadata", Arc::clone(&dropped)));
-            drainer.register(
-                "meta_events_node",
-                &skel.maps.METADATA_EVENTS,
-                Arc::new(move |data| {
-                    if let Some(event) = decode_event::<MetadataEvent>(data)
-                        && tx.try_send(event).is_err()
-                    {
-                        dropped.fetch_add(1, Ordering::Relaxed);
-                    }
-                }),
-            )?;
-            Ok::<_, anyhow::Error>(rx)
-        })
-        .transpose()?;
-
-    let drainers = drainer.start()?;
-
-    // Attach the enabled signals' programs now that their rings are wired up.
-    if let Some(skel) = &mut io_skel {
-        skel.attach()?;
-    }
-    if let Some(skel) = &mut metadata_skel {
-        skel.attach()?;
-    }
-    if let Some(skel) = &mut profiling_skel {
-        skel.attach()?;
-    }
-    info!("eBPF programs attached!");
-
     // Install the global tracer provider (OTLP/gRPC), kept alive for the whole run
     // so buffered spans flush on exit. The demand-driven unwind loader and
     // symbolization create spans against it.
     let _tracing_guard = telemetry::init_tracing();
 
     // Single owner of per-cgroup meter providers and cgroup liveness, shared by
-    // every feature. IO and metadata each contribute their histogram aggregation
-    // views.
+    // every collector. IO and metadata each contribute their histogram
+    // aggregation views.
     let mut histogram_views = metrics::io::histogram_views();
     histogram_views.extend(metrics::metadata::histogram_views());
     let registry = Arc::new(CgroupRegistry::new(
@@ -321,120 +180,58 @@ async fn run_async(args: Args) -> Result<()> {
         args.drop_unhandled,
     ));
 
-    // IO + metadata metrics: shared behind an `Arc` so the ringbuffer callbacks
-    // (`'static` closures) can record into them. `None` when the signal is off.
-    let io_metrics = io_enabled.then(|| Arc::new(IoMetrics::new(Arc::clone(&registry))));
-    let metadata_metrics =
-        metadata_enabled.then(|| Arc::new(MetadataMetrics::new(Arc::clone(&registry))));
+    // Build one collector per enabled signal. Each opens + loads its own BPF
+    // object (a disabled signal costs no verification and creates no maps),
+    // registers its per-NUMA-node rings with the shared drainer, and spawns its
+    // own record/periodic tasks. Nothing is attached yet.
+    let mut drainer = numa::DrainerBuilder::new();
+    let mut collectors: Vec<Box<dyn Collector>> = Vec::new();
+    {
+        let mut ctx = BuildCtx {
+            registry: Arc::clone(&registry),
+            v1_hierarchy_id,
+            drainer: &mut drainer,
+        };
+        if io_enabled {
+            collectors.push(Box::new(IoCollector::new(&mut ctx)?));
+        }
+        if metadata_enabled {
+            collectors.push(Box::new(MetadataCollector::new(&mut ctx)?));
+        }
+        if profiling_enabled {
+            collectors.push(Box::new(CpuProfileCollector::new(
+                &mut ctx,
+                args.pyroscope_url.clone(),
+                args.profile_frequency,
+                args.profile_interval_secs,
+            )?));
+        }
+    }
+    info!("eBPF objects loaded!");
 
-    // CPU profiler facade: owns the perf sampler, the native unwinder's userspace
-    // half, and the per-cgroup symbol caches. `None` when profiling is disabled.
-    let mut profiler = profiling_enabled.then(|| {
-        Profiler::new(
-            args.pyroscope_url.clone(),
-            telemetry::hostname(),
-            args.profile_frequency,
-            args.profile_interval_secs,
-            Arc::clone(&registry),
-        )
-    });
-    if let (Some(profiler), Some(skel)) = (&mut profiler, &profiling_skel) {
-        profiler.attach(&skel.progs.do_sample, args.profile_frequency)?;
+    if args.test_attach {
+        for collector in &mut collectors {
+            collector.attach()?;
+        }
+        info!("eBPF programs attached!");
+        return Ok(());
     }
 
-    // The unwind-miss sink is a cloneable `Arc<Mutex<..>>` the ringbuffer callback
-    // writes into; grab it now, before the profiler is moved behind its own mutex.
-    let miss_sink = profiler.as_ref().map(|p| p.miss_sink());
-
-    // Owned, fd-dup'd handles to the profiling maps the periodic tasks touch.
-    // `MapHandle` is `Send + Sync + 'static` (unlike the skel-borrowed `Map`), so
-    // it can move into independently spawned tasks without tying them to the
-    // skel's lifetime. Present exactly when the profiler is.
-    let prof_cleanup_maps = profiling_skel
-        .as_ref()
-        .map(|skel| -> Result<_> {
-            Ok((
-                MapHandle::try_from(&skel.maps.UNWIND_ROWS)?,
-                MapHandle::try_from(&skel.maps.EXECUTABLES)?,
-                MapHandle::try_from(&skel.maps.PROC_MAPPINGS)?,
-            ))
-        })
-        .transpose()?;
-    let prof_drain_maps = profiling_skel
-        .as_ref()
-        .map(|skel| -> Result<_> {
-            Ok((
-                MapHandle::try_from(&skel.maps.STACK_COUNTS)?,
-                MapHandle::try_from(&skel.maps.STACKS)?,
-            ))
-        })
-        .transpose()?;
-
-    // Share the profiler between the cleanup task (needs `&mut` for `on_cleanup`)
-    // and the profile task; an async mutex because both hold the guard across
-    // `.await`.
-    let profiler = profiler.map(|p| Arc::new(tokio::sync::Mutex::new(p)));
-
-    // Events arrive via the per-NUMA-node draining threads (see the drainer
-    // registration above) over each feature's channel; one task per feature
-    // drains its channel and runs the async `record` path, serially as the
-    // single consume loop did before.
-    let mut record_tasks = Vec::new();
-    if let (Some(mut rx), Some(m)) = (io_rx, io_metrics.clone()) {
-        record_tasks.push(tokio::spawn(async move {
-            // Drain in batches to amortize the per-event await overhead.
-            let mut batch = Vec::with_capacity(1024);
-            // recv_many returning 0 means all draining threads have stopped.
-            while rx.recv_many(&mut batch, 1024).await > 0 {
-                for event in batch.drain(..) {
-                    m.record(&event).await;
-                }
-            }
-        }));
+    // Start the per-NUMA-node draining threads, then attach: every ring is
+    // populated before any program can produce an event.
+    let drainers = drainer.start()?;
+    for collector in &mut collectors {
+        collector.attach()?;
     }
-    if let (Some(mut rx), Some(m)) = (meta_rx, metadata_metrics.clone()) {
-        record_tasks.push(tokio::spawn(async move {
-            let mut batch = Vec::with_capacity(1024);
-            while rx.recv_many(&mut batch, 1024).await > 0 {
-                for event in batch.drain(..) {
-                    m.record(&event).await;
-                }
-            }
-        }));
-    }
+    info!("eBPF programs attached!");
 
-    // Unwind-miss ring buffer (a single global ring — low volume, only exists
-    // when profiling is on). Drained on the tokio runtime via its epoll fd; when
-    // profiling is off there is no ring and the main loop just waits for Ctrl-C.
-    let misses_ringbuf = if let (Some(misses), Some(skel)) = (miss_sink, &profiling_skel) {
-        let mut rb_builder = RingBufferBuilder::new();
-        rb_builder.add(&skel.maps.UNWIND_MISSES, move |data: &[u8]| {
-            if let Some(miss) = decode_event::<UnwindMiss>(data) {
-                misses.lock().unwrap().insert(miss.tgid, miss.cgroup_id);
-            }
-            0
-        })?;
-        Some(rb_builder.build()?)
-    } else {
-        None
-    };
-
-    // Wrap the unwind-miss ring's epoll fd with tokio's AsyncFd for async polling.
-    let misses_fd = misses_ringbuf
-        .as_ref()
-        .map(|rb| {
-            AsyncFd::with_interest(
-                unsafe { BorrowedFd::borrow_raw(rb.epoll_fd()) },
-                tokio::io::Interest::READABLE,
-            )
-        })
-        .transpose()?;
+    // Shared with the cleanup task below; shutdown still walks them at the end.
+    let collectors: Arc<[Box<dyn Collector>]> = Arc::from(collectors);
 
     info!("Waiting for events... Press Ctrl-C to exit.");
 
-    // Metrics export: pull every live cgroup's ManualReader and push it through the
-    // shared OTLP exporter. Also surfaces the per-NUMA-node draining channel's
-    // overflow count, so a record loop that can't keep up is visible.
+    // Metrics export: pull every live cgroup's ManualReader and push it through
+    // the shared OTLP exporter, on one timer for all collectors.
     let metrics_task = tokio::spawn({
         let registry = Arc::clone(&registry);
         let mut interval =
@@ -445,108 +242,41 @@ async fn run_async(args: Args) -> Result<()> {
                 // Returns immediately after spawning one export task per cgroup, so a
                 // slow export never delays the next tick.
                 registry.collect_and_export_all();
-                for (feature, dropped) in &drop_counters {
-                    let dropped = dropped.swap(0, Ordering::Relaxed);
-                    if dropped > 0 {
-                        log::warn!(
-                            "{feature}: dropped {dropped} events: record loop fell behind"
-                        );
-                    }
-                }
             }
         }
     });
 
-    // Dead-cgroup reaping + per-feature pruning: one walk of /sys/fs/cgroup tears
-    // down dead providers and yields the live snapshot every feature prunes against.
+    // Dead-cgroup reaping + per-collector pruning: one walk of /sys/fs/cgroup
+    // tears down dead providers and yields the live snapshot every collector
+    // prunes against.
     let cleanup_task = tokio::spawn({
         let registry = Arc::clone(&registry);
-        let io_metrics = io_metrics.clone();
-        let metadata_metrics = metadata_metrics.clone();
-        let profiler = profiler.clone();
+        let collectors = Arc::clone(&collectors);
         let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
         async move {
             loop {
                 interval.tick().await;
                 let live = registry.cleanup_dead_cgroups().await;
-                if let Some(m) = &io_metrics {
-                    m.retain_live(&live);
-                }
-                if let Some(m) = &metadata_metrics {
-                    m.retain_live(&live);
-                }
-                if let (Some(profiler), Some((unwind_rows, executables, proc_mappings))) =
-                    (&profiler, &prof_cleanup_maps)
-                {
-                    let mut profiler = profiler.lock().await;
-                    profiler
-                        .on_cleanup(&live, unwind_rows, executables, proc_mappings)
-                        .await;
+                for collector in collectors.iter() {
+                    collector.on_cleanup(&live).await;
                 }
             }
         }
     });
 
-    // CPU profile drain + push, only when profiling is enabled.
-    let profile_task = profiler
-        .as_ref()
-        .zip(prof_drain_maps)
-        .map(|(profiler, (stack_counts, stacks))| {
-            let profiler = Arc::clone(profiler);
-            let mut interval =
-                tokio::time::interval(Duration::from_secs(args.profile_interval_secs.max(1)));
-            tokio::spawn(async move {
-                loop {
-                    interval.tick().await;
-                    profiler
-                        .lock()
-                        .await
-                        .collect_and_push(&stack_counts, &stacks)
-                        .await;
-                }
-            })
-        });
+    let _ = signal::ctrl_c().await;
+    info!("Ctrl-C received, exiting...");
 
-    loop {
-        match (&misses_fd, &misses_ringbuf) {
-            // Profiling on: drain the unwind-miss ring alongside watching for Ctrl-C.
-            (Some(async_fd), Some(ringbuf)) => {
-                tokio::select! {
-                    _ = async_fd.async_io(tokio::io::Interest::READABLE, |_| {
-                        let consumed = ringbuf.consume_raw();
-                        match consumed {
-                            n if n > 0 => Ok(n),
-                            0 => Err(std::io::ErrorKind::WouldBlock.into()),
-                            n => Err(std::io::Error::from_raw_os_error(-n)),
-                        }
-                    }) => {},
-                    _ = signal::ctrl_c() => {
-                        info!("Ctrl-C received, exiting...");
-                        break;
-                    }
-                }
-            }
-            // Profiling off: nothing else to poll, just wait for Ctrl-C.
-            _ => {
-                let _ = signal::ctrl_c().await;
-                info!("Ctrl-C received, exiting...");
-                break;
-            }
-        }
-    }
-
-    // Stop the periodic tasks before the skel drops. They hold only Arcs and
-    // fd-dup'd MapHandles (independent of the skel), so aborting is clean.
+    // Stop the shared timers and every collector's own tasks before the
+    // skeletons drop; the tasks hold only Arcs and fd-dup'd MapHandles
+    // (independent of the skels), so aborting is clean.
     metrics_task.abort();
     cleanup_task.abort();
-    for record_task in record_tasks {
-        record_task.abort();
+    for collector in collectors.iter() {
+        collector.shutdown();
     }
-    if let Some(profile_task) = profile_task {
-        profile_task.abort();
-    }
-    // Stop and join the per-NUMA-node draining threads before the skel (and its
-    // ring buffer maps) drop.
+    // Stop and join the per-NUMA-node draining threads before the collectors
+    // (and their ring buffer maps) drop.
     drainers.shutdown();
 
     Ok(())

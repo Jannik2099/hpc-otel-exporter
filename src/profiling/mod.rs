@@ -1,29 +1,37 @@
-//! CPU profiling: the [`Profiler`] facade that owns the whole sampling pipeline —
-//! perf-event sampling, the in-kernel unwinder's userspace half, draining and
-//! symbolizing the kernel's stack aggregation, building per-cgroup pprof, and
-//! pushing it to Pyroscope.
+//! The cpu_profiles signal: perf-event sampling, the in-kernel unwinder's
+//! userspace half, draining and symbolizing the kernel's stack aggregation,
+//! building per-cgroup pprof, and pushing it to Pyroscope.
 //!
-//! The event loop ([`crate::app`]) drives it through a small surface:
-//! [`Profiler::attach`] (start sampling), [`Profiler::miss_sink`] (the ringbuffer
-//! callback's drop point for unwind misses), [`Profiler::on_cleanup`] (per
-//! cleanup-tick reconciliation), and [`Profiler::collect_and_push`] (per
-//! profile-tick drain + upload). Everything else — the unwind loader, the symbol
-//! caches, the perf sampler guard — is encapsulated here.
+//! [`CpuProfileCollector`] is the signal's [`Collector`] implementation: it
+//! owns the profiling eBPF object (`src/bpf/profiling.bpf.c`, its own
+//! skeleton), the perf sampler guard, the unwind-miss ring drain task and the
+//! periodic drain+push task. The [`Profiler`] facade underneath owns the
+//! pipeline state (fd-dup'd map handles, symbol caches, the unwind loader) and
+//! exposes [`Profiler::on_cleanup`] (per cleanup-tick reconciliation) and
+//! [`Profiler::collect_and_push`] (per profile-tick drain + upload).
 //!
 //! Submodules: [`perf_event`] (sampling sources), [`unwind`]/[`unwind_loader`]/
 //! [`proc_maps`] (the native unwinder's table building/loading), [`symbolize`]
 //! (address → frame resolution + caching), [`pprof`]/[`push`]/[`proto`] (output).
 
 use std::collections::HashMap;
+use std::mem::MaybeUninit;
+use std::os::fd::BorrowedFd;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use libbpf_rs::{MapCore, MapFlags, ProgramMut};
+use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
+use libbpf_rs::{MapCore, MapFlags, MapHandle, RingBufferBuilder};
 use prost::Message;
 use rustc_hash::{FxHashMap, FxHashSet};
+use tokio::io::unix::AsyncFd;
 
-use crate::bindings::StackKey;
+use crate::bindings::{StackKey, UnwindMiss};
+use crate::bpf;
 use crate::cgroup::{CgroupRegistry, PerCgroup};
+use crate::collector::{BoxFuture, BuildCtx, Collector, configure_cgroup_rodata};
+use crate::numa::decode_event;
+use crate::telemetry;
 
 mod debuginfod;
 mod perf_event;
@@ -36,7 +44,6 @@ mod unwind;
 mod unwind_loader;
 
 use debuginfod::DebuginfodClient;
-use perf_event::{PerfSampler, attach_perf_samplers};
 use pprof::ProfileBuilder;
 use push::Pusher;
 use symbolize::{
@@ -116,21 +123,37 @@ pub struct Profiler {
     /// cleanup tick to load their unwind info. A tgid maps to one cgroup; a
     /// re-miss before draining just keeps the latest.
     pending_misses: Arc<Mutex<FxHashMap<u32, u64>>>,
-    /// Holds the perf-event fds + attachments alive; dropping it detaches the
-    /// sampler. `None` until [`attach`](Self::attach).
-    sampler: Option<PerfSampler>,
+    /// Owned handles to the profiling BPF maps the periodic work touches.
+    maps: ProfilerMaps,
+}
+
+/// Owned, fd-dup'd handles to the profiling maps. `MapHandle` is
+/// `Send + Sync + 'static` (unlike the skel-borrowed `Map`), so the profiler
+/// can live in spawned tasks without tying them to the skeleton's lifetime.
+pub struct ProfilerMaps {
+    /// exec_id -> inner unwind-table map (`UNWIND_ROWS`).
+    unwind_rows: MapHandle,
+    /// exec_id -> ExecInfo (`EXECUTABLES`).
+    executables: MapHandle,
+    /// tgid -> ProcessMappings (`PROC_MAPPINGS`).
+    proc_mappings: MapHandle,
+    /// The kernel's per-(cgroup, thread, stack) sample aggregation (`STACK_COUNTS`).
+    stack_counts: MapHandle,
+    /// stack_id -> captured addresses (`STACKS`).
+    stacks: MapHandle,
 }
 
 /// A cloneable handle the ringbuffer callback uses to record unwind misses.
 pub type MissSink = Arc<Mutex<FxHashMap<u32, u64>>>;
 
 impl Profiler {
-    pub fn new(
+    fn new(
         base_url: String,
         hostname: String,
         freq: u64,
         interval_secs: u64,
         registry: Arc<CgroupRegistry>,
+        maps: ProfilerMaps,
     ) -> Self {
         // Opt-in via the standard debuginfod environment; a misconfiguration is
         // logged and treated as "disabled" rather than failing profiler startup.
@@ -158,57 +181,52 @@ impl Profiler {
             debuginfod,
             loader: UnwindLoader::new(registry),
             pending_misses: Arc::new(Mutex::new(FxHashMap::default())),
-            sampler: None,
+            maps,
         }
-    }
-
-    /// Start CPU sampling: open one perf event per online CPU and attach the
-    /// `do_sample` BPF program to each, keeping the attachments alive for the
-    /// profiler's lifetime.
-    pub fn attach(&mut self, prog: &ProgramMut, freq: u64) -> anyhow::Result<()> {
-        self.sampler = Some(attach_perf_samplers(prog, freq)?);
-        Ok(())
     }
 
     /// A cloneable handle for the `UNWIND_MISSES` ringbuffer callback to record
     /// misses into; serviced on the next [`on_cleanup`](Self::on_cleanup).
-    pub fn miss_sink(&self) -> MissSink {
+    fn miss_sink(&self) -> MissSink {
         Arc::clone(&self.pending_misses)
     }
 
     /// Per-cleanup-tick reconciliation against the registry's `live` snapshot:
     /// prune dead cgroups' symbol caches, service pending unwind misses (loading
-    /// their tables from the given `UNWIND_ROWS`/`EXECUTABLES`/`PROC_MAPPINGS`
-    /// maps), evict tables of exited processes, and refresh the resident-table
-    /// gauges.
-    pub async fn on_cleanup(
-        &mut self,
-        live: &FxHashSet<u64>,
-        unwind_rows: &impl MapCore,
-        executables: &impl MapCore,
-        proc_mappings: &impl MapCore,
-    ) {
+    /// their tables into the unwind maps), evict tables of exited processes, and
+    /// refresh the resident-table gauges.
+    pub async fn on_cleanup(&mut self, live: &FxHashSet<u64>) {
         self.retain_live(live);
         self.loader.retain_live(live);
 
         let misses: Vec<(u32, u64)> = self.pending_misses.lock().unwrap().drain().collect();
         for (pid, cgroup_id) in misses {
             self.loader
-                .ensure_pid(pid, cgroup_id, unwind_rows, executables, proc_mappings)
+                .ensure_pid(
+                    pid,
+                    cgroup_id,
+                    &self.maps.unwind_rows,
+                    &self.maps.executables,
+                    &self.maps.proc_mappings,
+                )
                 .await;
         }
-        self.loader
-            .evict_dead(unwind_rows, executables, proc_mappings);
+        self.loader.evict_dead(
+            &self.maps.unwind_rows,
+            &self.maps.executables,
+            &self.maps.proc_mappings,
+        );
         // Refresh the per-cgroup resident-table gauges now that this tick's loads
         // and evictions are reflected in the loader state.
         self.loader.record_table_gauges();
     }
 
     /// Per-profile-tick: drain + symbolize + build per-cgroup pprof, then spawn the
-    /// upload so the event loop never blocks on network IO. `counts`/`stacks` are
-    /// the `STACK_COUNTS`/`STACKS` maps.
-    pub async fn collect_and_push(&self, counts: &impl MapCore, stacks: &impl MapCore) {
-        let profiles = self.collect(counts, stacks).await;
+    /// upload so the periodic task never blocks on network IO.
+    pub async fn collect_and_push(&self) {
+        let profiles = self
+            .collect(&self.maps.stack_counts, &self.maps.stacks)
+            .await;
         if profiles.is_empty() {
             return;
         }
@@ -437,6 +455,172 @@ impl Profiler {
         }
         cg.metrics.profiles_collected.add(1);
         builder.finish().encode_to_vec()
+    }
+}
+
+/// The cpu_profiles signal: owns the profiling eBPF object, the perf sampler
+/// attachment, the unwind-miss drain task, and the periodic drain+push task
+/// around the shared [`Profiler`].
+pub struct CpuProfileCollector {
+    skel: bpf::profiling::ProfilingSkel<'static>,
+    /// Shared with the periodic profile task; an async mutex because both this
+    /// collector's cleanup hook and that task hold the guard across `.await`.
+    profiler: Arc<tokio::sync::Mutex<Profiler>>,
+    /// Holds the perf-event fds + attachments alive; dropping it detaches the
+    /// sampler. `None` until [`Collector::attach`].
+    sampler: Option<perf_event::PerfSampler>,
+    freq: u64,
+    profile_task: tokio::task::JoinHandle<()>,
+    misses_task: tokio::task::JoinHandle<()>,
+}
+
+impl CpuProfileCollector {
+    /// Open + load the profiling eBPF object and spawn the unwind-miss drain
+    /// and periodic profile tasks. Sampling starts at [`Collector::attach`].
+    pub fn new(
+        ctx: &mut BuildCtx,
+        pyroscope_url: String,
+        freq: u64,
+        interval_secs: u64,
+    ) -> anyhow::Result<Self> {
+        // The skeleton borrows its open-object storage; leak that storage (one
+        // small allocation per enabled signal, for the process lifetime) so the
+        // collector can own the skeleton without a self-referential struct.
+        let storage = Box::leak(Box::new(MaybeUninit::uninit()));
+        let mut open_skel = bpf::profiling::ProfilingSkelBuilder::default().open(storage)?;
+        configure_cgroup_rodata!(open_skel, ctx.v1_hierarchy_id);
+        // The perf_event sampler needs a per-CPU perf fd, so it is attached
+        // explicitly in `attach`; keep skel.attach() from trying to auto-attach.
+        open_skel.progs.do_sample.set_autoattach(false);
+        let skel = open_skel.load()?;
+
+        let profiler = Profiler::new(
+            pyroscope_url,
+            telemetry::hostname(),
+            freq,
+            interval_secs,
+            Arc::clone(&ctx.registry),
+            ProfilerMaps {
+                unwind_rows: MapHandle::try_from(&skel.maps.UNWIND_ROWS)?,
+                executables: MapHandle::try_from(&skel.maps.EXECUTABLES)?,
+                proc_mappings: MapHandle::try_from(&skel.maps.PROC_MAPPINGS)?,
+                stack_counts: MapHandle::try_from(&skel.maps.STACK_COUNTS)?,
+                stacks: MapHandle::try_from(&skel.maps.STACKS)?,
+            },
+        );
+        let miss_sink = profiler.miss_sink();
+        let profiler = Arc::new(tokio::sync::Mutex::new(profiler));
+
+        // Unwind-miss ring buffer: a single global ring (low volume), drained
+        // on the tokio runtime via its epoll fd into the profiler's miss sink.
+        let misses_map = MapHandle::try_from(&skel.maps.UNWIND_MISSES)?;
+        let misses_task = tokio::spawn(drain_misses(misses_map, miss_sink));
+
+        // Periodic drain + symbolize + push. Ticks before attach are no-ops on
+        // empty maps.
+        let profile_task = tokio::spawn({
+            let profiler = Arc::clone(&profiler);
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
+            async move {
+                loop {
+                    interval.tick().await;
+                    profiler.lock().await.collect_and_push().await;
+                }
+            }
+        });
+
+        Ok(Self {
+            skel,
+            profiler,
+            sampler: None,
+            freq,
+            profile_task,
+            misses_task,
+        })
+    }
+}
+
+impl Collector for CpuProfileCollector {
+    fn attach(&mut self) -> anyhow::Result<()> {
+        self.skel.attach()?;
+        // Start CPU sampling: one perf event per online CPU, each with the
+        // do_sample program, kept alive for the collector's lifetime.
+        self.sampler = Some(perf_event::attach_perf_samplers(
+            &self.skel.progs.do_sample,
+            self.freq,
+        )?);
+        Ok(())
+    }
+
+    fn on_cleanup<'a>(&'a self, live: &'a FxHashSet<u64>) -> BoxFuture<'a> {
+        Box::pin(async move {
+            self.profiler.lock().await.on_cleanup(live).await;
+        })
+    }
+
+    fn shutdown(&self) {
+        self.profile_task.abort();
+        self.misses_task.abort();
+    }
+}
+
+/// Drain the `UNWIND_MISSES` ring into the profiler's miss sink on the tokio
+/// runtime: register the ring's epoll fd with the reactor and consume whenever
+/// it turns readable. Readiness is cleared *before* consuming so a submit
+/// racing the drain re-arms the fd rather than being lost.
+async fn drain_misses(map: MapHandle, sink: MissSink) {
+    // Scoped so the (non-Send) builder is provably dead before the first
+    // await; only the Send `RingBuffer` crosses it.
+    let ringbuf = {
+        let mut builder = RingBufferBuilder::new();
+        let added = builder
+            .add(&map, move |data: &[u8]| {
+                if let Some(miss) = decode_event::<UnwindMiss>(data) {
+                    sink.lock().unwrap().insert(miss.tgid, miss.cgroup_id);
+                }
+                0
+            })
+            .map(|_| ());
+        added.and_then(|()| builder.build())
+    };
+    let ringbuf = match ringbuf {
+        Ok(rb) => rb,
+        Err(e) => {
+            log::error!("failed to build the unwind-miss ring buffer: {e}");
+            return;
+        }
+    };
+
+    // Safety: the raw epoll fd belongs to `ringbuf`, which lives (owned by this
+    // future) for as long as the AsyncFd does.
+    let async_fd = match AsyncFd::with_interest(
+        unsafe { BorrowedFd::borrow_raw(ringbuf.epoll_fd()) },
+        tokio::io::Interest::READABLE,
+    ) {
+        Ok(fd) => fd,
+        Err(e) => {
+            log::error!("failed to register the unwind-miss ring with the runtime: {e}");
+            return;
+        }
+    };
+
+    loop {
+        let mut guard = match async_fd.readable().await {
+            Ok(guard) => guard,
+            Err(e) => {
+                log::error!("unwind-miss ring poll failed: {e}");
+                return;
+            }
+        };
+        guard.clear_ready();
+        let consumed = ringbuf.consume_raw();
+        if consumed < 0 {
+            log::warn!(
+                "unwind-miss ring consume failed: {}",
+                std::io::Error::from_raw_os_error(-consumed as i32)
+            );
+        }
     }
 }
 
