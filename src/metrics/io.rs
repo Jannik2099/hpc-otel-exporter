@@ -260,14 +260,19 @@ impl IoCollector {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<IOEvent>(CHANNEL_CAPACITY);
         let dropped = Arc::new(AtomicU64::new(0));
+        // TEMPORARY DIAGNOSTIC (see metadata.rs): channel inflow, counted on
+        // the draining threads, printed to stderr from the record loop below.
+        let diag_inflow = Arc::new(AtomicU64::new(0));
         ctx.drainer
             .register("io_events_node", &skel.maps.IO_EVENTS, {
                 let dropped = Arc::clone(&dropped);
+                let diag_inflow = Arc::clone(&diag_inflow);
                 Arc::new(move |data| {
-                    if let Some(event) = decode_event::<IOEvent>(data)
-                        && tx.try_send(event).is_err()
-                    {
-                        dropped.fetch_add(1, Ordering::Relaxed);
+                    if let Some(event) = decode_event::<IOEvent>(data) {
+                        diag_inflow.fetch_add(1, Ordering::Relaxed);
+                        if tx.try_send(event).is_err() {
+                            dropped.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 })
             })?;
@@ -278,10 +283,39 @@ impl IoCollector {
             async move {
                 // Drain in batches to amortize the per-event await overhead;
                 // recv_many returning 0 means the draining threads have stopped.
+                //
+                // TEMPORARY DIAGNOSTIC: select! so the heartbeat prints every
+                // 5s whether the task is saturated or idle; recv_many is
+                // cancel-safe, so the raced receive loses no events.
                 let mut batch = Vec::with_capacity(1024);
-                while rx.recv_many(&mut batch, 1024).await > 0 {
-                    for event in batch.drain(..) {
-                        metrics.record(&event).await;
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut window_start = std::time::Instant::now();
+                let mut consumed = 0u64;
+                loop {
+                    tokio::select! {
+                        n = rx.recv_many(&mut batch, 1024) => {
+                            if n == 0 {
+                                break;
+                            }
+                            for event in batch.drain(..) {
+                                metrics.record(&event).await;
+                            }
+                            consumed += n as u64;
+                        }
+                        _ = interval.tick() => {
+                            let secs = window_start.elapsed().as_secs_f64().max(1e-9);
+                            let inflow = diag_inflow.swap(0, Ordering::Relaxed);
+                            eprintln!(
+                                "[diag io_requests] window={secs:.1}s inflow={inflow} ({:.0}/s) \
+                                 consumed={consumed} ({:.0}/s) backlog={}",
+                                inflow as f64 / secs,
+                                consumed as f64 / secs,
+                                rx.len(),
+                            );
+                            window_start = std::time::Instant::now();
+                            consumed = 0;
+                        }
                     }
                 }
             }

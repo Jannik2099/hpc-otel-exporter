@@ -10,15 +10,16 @@
 //! shares one metric. There is no size component: these ops transfer no bytes.
 
 use std::mem::MaybeUninit;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{BoundHistogram, Histogram};
 use opentelemetry_sdk::metrics::{Aggregation, Instrument, Stream};
-use rustc_hash::{FxBuildHasher, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use crate::bindings::{self, MetadataEvent, MetadataOp};
 use crate::bpf;
@@ -76,6 +77,131 @@ pub fn histogram_views() -> Vec<CgroupView> {
     vec![duration_view]
 }
 
+// ---------------------------------------------------------------------------
+// TEMPORARY DIAGNOSTIC for the record-loop saturation investigation.
+//
+// Counts every event at the ring callback (channel inflow) and classifies
+// every event leaving `record()` by (op, fs magic, outcome), plus the top
+// (cgroup_id, tgid) sources. Printed straight to stderr every
+// [`DIAG_INTERVAL`] — deliberately NOT through `log`, so the output cannot be
+// stalled by the OTLP export pipelines. Remove once the investigation is done.
+// ---------------------------------------------------------------------------
+
+/// How often the record task prints the diagnostic window to stderr.
+const DIAG_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Bound on distinct tally/source keys kept per window, so pathological id
+/// churn can't balloon the maps; excess events are counted in `overflow`.
+const DIAG_MAX_KEYS: usize = 4096;
+
+/// How an event left [`MetadataMetrics::record`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum DiagOutcome {
+    /// Dropped by the userspace ephemeral-fs filter.
+    Ephemeral,
+    /// The registry resolved no meter (root / filter-dropped / unresolvable
+    /// cgroup): the event crossed the channel and ran `get_or_create`, then
+    /// was silently discarded.
+    NoMeter,
+    /// Recorded into the histogram.
+    Recorded,
+}
+
+impl DiagOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            DiagOutcome::Ephemeral => "ephemeral",
+            DiagOutcome::NoMeter => "no-meter",
+            DiagOutcome::Recorded => "recorded",
+        }
+    }
+}
+
+#[derive(Default)]
+struct RecordDiag {
+    /// Events decoded off the rings, before the channel `try_send` (inflow).
+    inflow: AtomicU64,
+    /// Events dropped because the channel was full (cumulative).
+    send_dropped: AtomicU64,
+    /// (op, fs magic, fs name, outcome) -> events this window.
+    #[allow(clippy::type_complexity)]
+    tally: Mutex<FxHashMap<(&'static str, u64, &'static str, DiagOutcome), u64>>,
+    /// (cgroup_id, tgid) -> events this window, to name the top sources.
+    sources: Mutex<FxHashMap<(u64, u32), u64>>,
+    /// Events not tallied because a map hit [`DIAG_MAX_KEYS`].
+    overflow: AtomicU64,
+}
+
+impl RecordDiag {
+    /// Classify one event. Called from the (single) record task; the mutexes
+    /// are uncontended and exist only to satisfy `Sync`.
+    fn count(&self, event: &bindings::MetadataEvent, outcome: DiagOutcome) {
+        let key = (
+            event.op.as_str(),
+            event.fs_magic as u64,
+            event.fs_magic.magic_to_pretty_name().unwrap_or("-"),
+            outcome,
+        );
+        let mut tally = self.tally.lock().unwrap();
+        if tally.len() < DIAG_MAX_KEYS || tally.contains_key(&key) {
+            *tally.entry(key).or_insert(0) += 1;
+        } else {
+            self.overflow.fetch_add(1, Ordering::Relaxed);
+        }
+        drop(tally);
+
+        let key = (event.cgroup_id, event.tgid);
+        let mut sources = self.sources.lock().unwrap();
+        if sources.len() < DIAG_MAX_KEYS || sources.contains_key(&key) {
+            *sources.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    /// Print one window to stderr and reset the window counters.
+    /// `consumed`/`record_ns` are the record loop's own tallies for the window.
+    fn print(&self, elapsed: Duration, backlog: usize, consumed: u64, record_ns: u64) {
+        let secs = elapsed.as_secs_f64().max(1e-9);
+        let inflow = self.inflow.swap(0, Ordering::Relaxed);
+        let dropped = self.send_dropped.load(Ordering::Relaxed);
+        let overflow = self.overflow.swap(0, Ordering::Relaxed);
+        let avg_us = if consumed > 0 {
+            record_ns as f64 / consumed as f64 / 1000.0
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[diag vfs_metadata] window={secs:.1}s inflow={inflow} ({:.0}/s) \
+             consumed={consumed} ({:.0}/s) backlog={backlog} avg_record_us={avg_us:.1} \
+             send_dropped_total={dropped} tally_overflow={overflow}",
+            inflow as f64 / secs,
+            consumed as f64 / secs,
+        );
+
+        let mut tally: Vec<_> = self.tally.lock().unwrap().drain().collect();
+        tally.sort_unstable_by_key(|&(_, n)| std::cmp::Reverse(n));
+        for ((op, magic, fs_name, outcome), n) in tally.into_iter().take(20) {
+            eprintln!(
+                "[diag vfs_metadata]   op={op} fs={magic:#x}/{fs_name} outcome={} n={n}",
+                outcome.as_str()
+            );
+        }
+
+        let mut sources: Vec<_> = self.sources.lock().unwrap().drain().collect();
+        sources.sort_unstable_by_key(|&(_, n)| std::cmp::Reverse(n));
+        for ((cgroup_id, tgid), n) in sources.into_iter().take(10) {
+            // Best-effort process name; the storm's tgid may already be gone.
+            // /proc is on PROC_SUPER_MAGIC, which the BPF side filters, so this
+            // read cannot feed back into the event stream.
+            let comm = std::fs::read_to_string(format!("/proc/{tgid}/comm"))
+                .map(|s| s.trim().to_owned())
+                .unwrap_or_else(|_| "?".to_owned());
+            eprintln!(
+                "[diag vfs_metadata]   src cgroup={cgroup_id} tgid={tgid} comm={comm} n={n}"
+            );
+        }
+    }
+}
+
 /// Per-cgroup metadata instrument, attached to the cgroup's shared [`CgroupMeter`].
 struct MetadataCgroup {
     meter: Arc<CgroupMeter>,
@@ -91,15 +217,18 @@ struct MetadataCgroup {
 pub struct MetadataMetrics {
     cgroups: PerCgroup<MetadataCgroup>,
     attrs_to_metrics: DashMap<(u64, u32, u64, bool), BoundHistogram<u64>, FxBuildHasher>,
+    /// TEMPORARY DIAGNOSTIC: per-window event classification (see [`RecordDiag`]).
+    diag: Arc<RecordDiag>,
 }
 
 impl MetadataMetrics {
     /// Create a new (empty) `MetadataMetrics` sharing `registry` for provider
     /// lifetime.
-    pub fn new(registry: Arc<CgroupRegistry>) -> Self {
+    fn new(registry: Arc<CgroupRegistry>, diag: Arc<RecordDiag>) -> Self {
         Self {
             cgroups: PerCgroup::new(registry),
             attrs_to_metrics: DashMap::default(),
+            diag,
         }
     }
 
@@ -108,6 +237,7 @@ impl MetadataMetrics {
     /// meter) are dropped.
     pub async fn record(&self, event: &bindings::MetadataEvent) {
         if event.fs_magic.is_ephemeral_fs() {
+            self.diag.count(event, DiagOutcome::Ephemeral);
             return;
         }
 
@@ -128,7 +258,10 @@ impl MetadataMetrics {
             .await
         {
             Some(m) => m,
-            None => return,
+            None => {
+                self.diag.count(event, DiagOutcome::NoMeter);
+                return;
+            }
         };
 
         let duration_ns = event
@@ -166,6 +299,7 @@ impl MetadataMetrics {
             });
 
         histogram.record(duration_ns);
+        self.diag.count(event, DiagOutcome::Recorded);
     }
 
     /// Drop metadata instruments for cgroups absent from `live` (the registry's
@@ -203,31 +337,63 @@ impl MetadataCollector {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<MetadataEvent>(CHANNEL_CAPACITY);
         let dropped = Arc::new(AtomicU64::new(0));
+        let diag = Arc::new(RecordDiag::default());
         ctx.drainer.register(
             "vfs_metadata_events_node",
             &skel.maps.VFS_METADATA_EVENTS,
             {
                 let dropped = Arc::clone(&dropped);
+                let diag = Arc::clone(&diag);
                 Arc::new(move |data| {
-                    if let Some(event) = decode_event::<MetadataEvent>(data)
-                        && tx.try_send(event).is_err()
-                    {
-                        dropped.fetch_add(1, Ordering::Relaxed);
+                    if let Some(event) = decode_event::<MetadataEvent>(data) {
+                        // TEMPORARY DIAGNOSTIC: true channel inflow, counted on
+                        // the draining threads before the try_send.
+                        diag.inflow.fetch_add(1, Ordering::Relaxed);
+                        if tx.try_send(event).is_err() {
+                            diag.send_dropped.fetch_add(1, Ordering::Relaxed);
+                            dropped.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 })
             },
         )?;
 
-        let metrics = Arc::new(MetadataMetrics::new(Arc::clone(&ctx.registry)));
+        let metrics = Arc::new(MetadataMetrics::new(Arc::clone(&ctx.registry), Arc::clone(&diag)));
         let record_task = tokio::spawn({
             let metrics = Arc::clone(&metrics);
             async move {
                 // Drain in batches to amortize the per-event await overhead;
                 // recv_many returning 0 means the draining threads have stopped.
+                //
+                // TEMPORARY DIAGNOSTIC: the loop is a select! so the window
+                // print fires every DIAG_INTERVAL whether the task is
+                // saturated or idle; recv_many is cancel-safe, so the raced
+                // receive loses no events.
                 let mut batch = Vec::with_capacity(1024);
-                while rx.recv_many(&mut batch, 1024).await > 0 {
-                    for event in batch.drain(..) {
-                        metrics.record(&event).await;
+                let mut interval = tokio::time::interval(DIAG_INTERVAL);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut window_start = Instant::now();
+                let mut consumed = 0u64;
+                let mut record_ns = 0u64;
+                loop {
+                    tokio::select! {
+                        n = rx.recv_many(&mut batch, 1024) => {
+                            if n == 0 {
+                                break;
+                            }
+                            let start = Instant::now();
+                            for event in batch.drain(..) {
+                                metrics.record(&event).await;
+                            }
+                            record_ns += start.elapsed().as_nanos() as u64;
+                            consumed += n as u64;
+                        }
+                        _ = interval.tick() => {
+                            metrics.diag.print(window_start.elapsed(), rx.len(), consumed, record_ns);
+                            window_start = Instant::now();
+                            consumed = 0;
+                            record_ns = 0;
+                        }
                     }
                 }
             }
