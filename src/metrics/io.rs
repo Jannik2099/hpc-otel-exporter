@@ -81,9 +81,9 @@ pub fn histogram_views() -> Vec<CgroupView> {
         if inst.name() == "io.duration" {
             Stream::builder()
                 .with_aggregation(Aggregation::Base2ExponentialHistogram {
-                    max_size: 20,
-                    max_scale: 4,
-                    record_min_max: true,
+                    max_size: 160,
+                    max_scale: 20,
+                    record_min_max: false,
                 })
                 .build()
                 .ok()
@@ -92,17 +92,17 @@ pub fn histogram_views() -> Vec<CgroupView> {
         }
     });
 
-    // Explicit bucket histogram for io.request_size (64 B – 2 GiB).
+    // Explicit bucket histogram for io.request_size (1 B – 2 GiB).
     let mut boundaries = vec![0f64];
-    for i in 0..=25 {
-        boundaries.push(64f64 * (1u64 << i) as f64);
+    for i in 0..=31 {
+        boundaries.push(1f64 * (1u64 << i) as f64);
     }
     let size_view: CgroupView = Arc::new(move |inst: &Instrument| {
         if inst.name() == "io.request_size" {
             Stream::builder()
                 .with_aggregation(Aggregation::ExplicitBucketHistogram {
                     boundaries: boundaries.clone(),
-                    record_min_max: true,
+                    record_min_max: false,
                 })
                 .build()
                 .ok()

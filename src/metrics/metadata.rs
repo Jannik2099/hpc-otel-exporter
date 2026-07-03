@@ -62,9 +62,9 @@ pub fn histogram_views() -> Vec<CgroupView> {
         if inst.name() == "vfs.metadata.duration" {
             Stream::builder()
                 .with_aggregation(Aggregation::Base2ExponentialHistogram {
-                    max_size: 20,
-                    max_scale: 4,
-                    record_min_max: true,
+                    max_size: 160,
+                    max_scale: 20,
+                    record_min_max: false,
                 })
                 .build()
                 .ok()
