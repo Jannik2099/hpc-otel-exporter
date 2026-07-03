@@ -159,7 +159,14 @@ impl RecordDiag {
 
     /// Print one window to stderr and reset the window counters.
     /// `consumed`/`record_ns` are the record loop's own tallies for the window.
-    fn print(&self, elapsed: Duration, backlog: usize, consumed: u64, record_ns: u64) {
+    fn print(
+        &self,
+        elapsed: Duration,
+        backlog: usize,
+        consumed: u64,
+        record_ns: u64,
+        extra: String,
+    ) {
         let secs = elapsed.as_secs_f64().max(1e-9);
         let inflow = self.inflow.swap(0, Ordering::Relaxed);
         let dropped = self.send_dropped.load(Ordering::Relaxed);
@@ -172,7 +179,7 @@ impl RecordDiag {
         eprintln!(
             "[diag vfs_metadata] window={secs:.1}s inflow={inflow} ({:.0}/s) \
              consumed={consumed} ({:.0}/s) backlog={backlog} avg_record_us={avg_us:.1} \
-             send_dropped_total={dropped} tally_overflow={overflow}",
+             send_dropped_total={dropped} tally_overflow={overflow} extra={extra}",
             inflow as f64 / secs,
             consumed as f64 / secs,
         );
@@ -195,9 +202,7 @@ impl RecordDiag {
             let comm = std::fs::read_to_string(format!("/proc/{tgid}/comm"))
                 .map(|s| s.trim().to_owned())
                 .unwrap_or_else(|_| "?".to_owned());
-            eprintln!(
-                "[diag vfs_metadata]   src cgroup={cgroup_id} tgid={tgid} comm={comm} n={n}"
-            );
+            eprintln!("[diag vfs_metadata]   src cgroup={cgroup_id} tgid={tgid} comm={comm} n={n}");
         }
     }
 }
@@ -358,7 +363,10 @@ impl MetadataCollector {
             },
         )?;
 
-        let metrics = Arc::new(MetadataMetrics::new(Arc::clone(&ctx.registry), Arc::clone(&diag)));
+        let metrics = Arc::new(MetadataMetrics::new(
+            Arc::clone(&ctx.registry),
+            Arc::clone(&diag),
+        ));
         let record_task = tokio::spawn({
             let metrics = Arc::clone(&metrics);
             async move {
@@ -389,7 +397,7 @@ impl MetadataCollector {
                             consumed += n as u64;
                         }
                         _ = interval.tick() => {
-                            metrics.diag.print(window_start.elapsed(), rx.len(), consumed, record_ns);
+                            metrics.diag.print(window_start.elapsed(), rx.len(), consumed, record_ns, format!("{rx:?}"));
                             window_start = Instant::now();
                             consumed = 0;
                             record_ns = 0;
