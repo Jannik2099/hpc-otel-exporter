@@ -17,7 +17,8 @@ use rustc_hash::{FxBuildHasher, FxHashSet};
 use crate::bindings::{self, FsMagic, IOEvent};
 use crate::bpf;
 use crate::cgroup::{CgroupMeter, CgroupRegistry, CgroupView, PerCgroup};
-use crate::collector::{BoxFuture, BuildCtx, CHANNEL_CAPACITY, Collector, configure_cgroup_rodata};
+use crate::collector::{BoxFuture, BuildCtx, Collector, configure_cgroup_rodata};
+use crate::metrics::MetricEvent;
 use crate::numa::decode_event;
 
 impl FsMagic {
@@ -234,21 +235,26 @@ impl IoMetrics {
     }
 }
 
-/// The io_requests signal: owns the IO eBPF object, its per-NUMA-node ring
-/// registration, and the record task feeding [`IoMetrics`].
+/// The io_requests signal: owns the IO eBPF object and its per-NUMA-node ring
+/// registration. Decoded events go down the shared metric channel; the record
+/// task and [`IoMetrics`] recording live on the shared [`Recorders`] side.
+///
+/// [`Recorders`]: crate::metrics::Recorders
 pub struct IoCollector {
     skel: bpf::io::IoSkel<'static>,
     metrics: Arc<IoMetrics>,
-    record_task: tokio::task::JoinHandle<()>,
-    /// Events dropped because the record task fell behind; reported (and reset)
-    /// each cleanup tick.
+    /// Events dropped because the shared record loop fell behind (this signal's
+    /// share of shared-channel overflow); reported (and reset) each cleanup tick.
     dropped: Arc<AtomicU64>,
 }
 
 impl IoCollector {
     /// Open + load the IO eBPF object, register its rings with the shared
-    /// drainer, and spawn the record task. Programs attach later, via
-    /// [`Collector::attach`].
+    /// drainer (forwarding decoded events down the shared channel), and register
+    /// its [`IoMetrics`] with the shared [`Recorders`]. Programs attach later,
+    /// via [`Collector::attach`].
+    ///
+    /// [`Recorders`]: crate::metrics::Recorders
     pub fn new(ctx: &mut BuildCtx) -> anyhow::Result<Self> {
         // The skeleton borrows its open-object storage; leak that storage (one
         // small allocation per enabled signal, for the process lifetime) so the
@@ -258,14 +264,14 @@ impl IoCollector {
         configure_cgroup_rodata!(open_skel, ctx.v1_hierarchy_id);
         let skel = open_skel.load()?;
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<IOEvent>(CHANNEL_CAPACITY);
         let dropped = Arc::new(AtomicU64::new(0));
         ctx.drainer
             .register("io_events_node", &skel.maps.IO_EVENTS, {
+                let events = ctx.events.clone();
                 let dropped = Arc::clone(&dropped);
                 Arc::new(move |data| {
                     if let Some(event) = decode_event::<IOEvent>(data)
-                        && tx.try_send(event).is_err()
+                        && events.try_send(MetricEvent::Io(event)).is_err()
                     {
                         dropped.fetch_add(1, Ordering::Relaxed);
                     }
@@ -273,24 +279,11 @@ impl IoCollector {
             })?;
 
         let metrics = Arc::new(IoMetrics::new(Arc::clone(&ctx.registry)));
-        let record_task = tokio::spawn({
-            let metrics = Arc::clone(&metrics);
-            async move {
-                // Drain in batches to amortize the per-event await overhead;
-                // recv_many returning 0 means the draining threads have stopped.
-                let mut batch = Vec::with_capacity(1024);
-                while rx.recv_many(&mut batch, 1024).await > 0 {
-                    for event in batch.drain(..) {
-                        metrics.record(&event).await;
-                    }
-                }
-            }
-        });
+        ctx.recorders.io = Some(Arc::clone(&metrics));
 
         Ok(Self {
             skel,
             metrics,
-            record_task,
             dropped,
         })
     }
@@ -312,7 +305,7 @@ impl Collector for IoCollector {
         })
     }
 
-    fn shutdown(&self) {
-        self.record_task.abort();
-    }
+    /// No owned task to stop — the shared record task is owned and aborted by
+    /// [`crate::app`].
+    fn shutdown(&self) {}
 }
