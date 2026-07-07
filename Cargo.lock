@@ -920,6 +920,7 @@ dependencies = [
  "serde_json",
  "tcmalloc-better",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -2775,6 +2776,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

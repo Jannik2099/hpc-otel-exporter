@@ -25,31 +25,28 @@
 //!
 //! [`register`]: DrainerBuilder::register
 
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 use anyhow::Result;
-use libbpf_rs::{MapCore, MapFlags, MapHandle, MapType, RingBufferBuilder};
+use libbpf_rs::{MapCore, MapFlags, MapHandle, MapType, RingBuffer, RingBufferBuilder};
 use log::{error, info, warn};
+use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
+use tokio_util::sync::CancellationToken;
 
 /// Byte size of each per-node ring buffer. MUST stay in sync with
 /// `NUMA_RINGBUF_SIZE` in `src/bpf/numa_ringbuf.bpf.h`: the inner-map prototype
 /// is created at that size and the kernel's map-in-map compatibility check
 /// requires every inserted ring to match the prototype's metadata exactly.
-const RINGBUF_SIZE: u32 = 1 << 22; // 4 MiB
+const RINGBUF_SIZE: u32 = 1 << 16; // 64KiB
 
 /// `BPF_F_NUMA_NODE` (uapi/linux/bpf.h): place the ring's pages on a specific
 /// NUMA node. Also the only flag `BPF_MAP_TYPE_RINGBUF` permits, so the per-node
 /// rings carry exactly this flag to match the prototype's `map_flags`.
 const BPF_F_NUMA_NODE: u32 = 1 << 2;
-
-/// How long each draining thread blocks in `poll` before re-checking the stop
-/// flag. Only affects shutdown latency; events wake the poll immediately.
-const POLL_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// A feature's decode callback, run on the draining thread for every raw ring
 /// payload. Shared behind an `Arc` because the same callback drains every
@@ -129,7 +126,7 @@ impl DrainerBuilder {
     /// feature's ring for that node. With nothing registered (no event-driven
     /// feature enabled) no threads are spawned.
     pub fn start(self) -> Result<Drainers> {
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = CancellationToken::new();
         let mut threads = Vec::with_capacity(self.nodes.len());
 
         // Regroup the per-source ring columns into one row per node.
@@ -145,7 +142,7 @@ impl DrainerBuilder {
             if rings.is_empty() {
                 continue;
             }
-            let stop = Arc::clone(&stop);
+            let stop = stop.clone();
             let id = node.id;
             let thread = std::thread::Builder::new()
                 .name(format!("drain-node{id}"))
@@ -160,7 +157,7 @@ impl DrainerBuilder {
 /// Handle to the spawned per-node draining threads; [`shutdown`](Self::shutdown)
 /// stops and joins them.
 pub struct Drainers {
-    stop: Arc<AtomicBool>,
+    stop: CancellationToken,
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -169,7 +166,7 @@ impl Drainers {
     /// captured by the feature callbacks drop as the threads exit, closing the
     /// features' record channels so their record tasks end too.
     pub fn shutdown(self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop.cancel();
         for thread in self.threads {
             let _ = thread.join();
         }
@@ -211,7 +208,12 @@ fn insert_ring(outer: &impl MapCore, node: u32, ring: &MapHandle) -> Result<()> 
 /// node's rings, running each feature's decode callback, until signalled to
 /// stop. Owns the ring handles for its lifetime (the kernel keeps the rings
 /// alive via the outer arrays regardless).
-fn drain_node(id: u32, cpus: &[usize], rings: Vec<(MapHandle, RingCallback)>, stop: &AtomicBool) {
+fn drain_node(
+    id: u32,
+    cpus: &[usize],
+    rings: Vec<(MapHandle, RingCallback)>,
+    stop: &CancellationToken,
+) {
     pin_to_cpus(id, cpus);
 
     let mut builder = RingBufferBuilder::new();
@@ -233,10 +235,49 @@ fn drain_node(id: u32, cpus: &[usize], rings: Vec<(MapHandle, RingCallback)>, st
         }
     };
 
-    while !stop.load(Ordering::Relaxed) {
-        // Negative return is an error (e.g. EINTR); keep polling. A closed
-        // channel is the feature callback's business, not ours.
-        let _ = ring_buffer.poll_raw(POLL_TIMEOUT);
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            error!("node {id}: failed to build tokio runtime: {e}");
+            return;
+        }
+    };
+    runtime.block_on(drain_loop(id, &ring_buffer, stop));
+}
+
+/// Drain `ring_buffer` on the current-thread runtime: sleep in epoll on the
+/// ring's fd, and greedily `consume` whenever it becomes readable, until `stop`
+/// is cancelled. `consume` drains every pending event (the fd is edge-triggered,
+/// so a partial drain would leave events unwoken), then `clear_ready` re-arms
+/// the wait for the next batch.
+async fn drain_loop(id: u32, ring_buffer: &RingBuffer<'_>, stop: &CancellationToken) {
+    let epoll_fd = ring_buffer.epoll_fd();
+    let async_fd = match AsyncFd::with_interest(
+        unsafe { BorrowedFd::borrow_raw(epoll_fd) },
+        Interest::READABLE,
+    ) {
+        Ok(fd) => fd,
+        Err(e) => {
+            error!("node {id}: failed to register ring buffer epoll fd: {e}");
+            return;
+        }
+    };
+
+    loop {
+        tokio::select! {
+            _ = stop.cancelled() => break,
+            _ = async_fd.async_io(Interest::READABLE, |_| {
+                let consumed = ring_buffer.consume_raw();
+                match consumed {
+                    n if n > 0 => Ok(n),
+                    0 => Err(std::io::ErrorKind::WouldBlock.into()),
+                    n => Err(std::io::Error::from_raw_os_error(-n)),
+                }
+            }) => {}
+        };
     }
 }
 

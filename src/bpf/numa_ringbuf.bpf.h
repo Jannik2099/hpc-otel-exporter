@@ -20,21 +20,12 @@
 // `RINGBUF_SIZE` in src/numa.rs: the inner-map prototype below is created at
 // this size and the kernel's map-in-map compatibility check requires every
 // inserted ring to match the prototype's metadata exactly.
-#define NUMA_RINGBUF_SIZE (1 << 22) // 4 MiB
+#define NUMA_RINGBUF_SIZE (1 << 16) // 64 KiB
 
 // Ceiling on the NUMA node id used as the ARRAY_OF_MAPS key. Real hardware has
 // far fewer nodes; userspace only populates the slots for online nodes. An out
 // of range / unpopulated key falls back to node 0 (see numa_ringbuf_reserve).
 #define MAX_NUMA_NODES 256
-
-// Places the ring buffer's pages on a specific NUMA node (uapi/linux/bpf.h).
-// Defined here because it is a #define, not a BTF enum, so it isn't in
-// vmlinux.h. It is also the *only* flag BPF_MAP_TYPE_RINGBUF permits, which is
-// why the per-node inner rings cannot additionally use BPF_F_INNER_MAP for
-// dynamic sizing — every inner ring must instead match the prototype's size.
-#ifndef BPF_F_NUMA_NODE
-#define BPF_F_NUMA_NODE (1U << 2)
-#endif
 
 // Inner-map prototype: supplies the inner ring's type/size/flags so the outer
 // ARRAY_OF_MAPS can validate the rings userspace inserts. libbpf creates one
