@@ -2,17 +2,21 @@
 //!
 //! A signal is a vertical slice — its own standalone eBPF object (see
 //! `build.rs`'s `BPF_SRCS`) plus the userspace half that consumes it. A
-//! collector *owns* everything signal-specific: the loaded skeleton, any event
-//! channels and their record/drain tasks, and its per-cgroup state. The event
-//! loop ([`crate::app`]) only ever sees the trait, so adding a signal never
-//! grows the loop body.
+//! collector *owns* everything signal-specific: the loaded skeleton, its
+//! per-NUMA-node ring registration, and its per-cgroup state. Metric signals
+//! share one channel and one record task (see [`crate::metrics::Recorders`]).
+//! The event loop ([`crate::app`]) only ever
+//! sees the trait, so adding a signal never grows the loop body.
 //!
 //! Construction happens through a [`BuildCtx`]: the collector opens its
 //! skeleton (stamping the shared cgroup-mode rodata knobs, see
 //! [`configure_cgroup_rodata`]), loads it, registers its per-NUMA-node rings
-//! with the shared [`DrainerBuilder`], and spawns its own tasks. The app then
-//! starts the draining threads and calls [`Collector::attach`] on everyone —
-//! rings are always populated before any program can produce an event.
+//! with the shared [`DrainerBuilder`], and — for metric signals — registers its
+//! recording state with the shared [`Recorders`] and sends decoded events down
+//! the single shared channel (`ctx.events`).
+//! The app then starts the draining threads and calls [`Collector::attach`] on
+//! everyone — rings are always populated before any program can produce an
+//! event.
 
 use anyhow::Result;
 use rustc_hash::FxHashSet;
@@ -20,14 +24,16 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
+
 use crate::cgroup::CgroupRegistry;
+use crate::metrics::{MetricEvent, Recorders};
 use crate::numa::DrainerBuilder;
 
-/// Bound on a collector's channel buffering decoded events between the
-/// per-node draining threads and that collector's record task. On overflow
-/// events are dropped (and counted per collector) rather than blocking the
-/// draining thread — the same drop-on-full behaviour the kernel ring buffer
-/// already has.
+/// Bound on the single shared channel buffering decoded metric events between
+/// the per-node draining threads and the record task. On overflow events are
+/// dropped (and counted per signal) rather than blocking the draining thread —
+/// the same drop-on-full behaviour the kernel ring buffer already has.
 pub const CHANNEL_CAPACITY: usize = 1 << 16;
 
 /// An owned, boxed future, so [`Collector`] stays object-safe without an
@@ -44,6 +50,13 @@ pub struct BuildCtx<'a> {
     /// The shared per-NUMA-node drainer; collectors register their outer
     /// `ARRAY_OF_MAPS` + decode callback here (before any program attaches).
     pub drainer: &'a mut DrainerBuilder,
+    /// Sender for the single shared metric-event channel. A metric collector's
+    /// decode callback captures a clone and `try_send`s its tagged
+    /// [`MetricEvent`]; non-metric collectors ignore it.
+    pub events: mpsc::Sender<MetricEvent>,
+    /// The shared record-side state. A metric collector stores its `*Metrics`
+    /// here so the single record task can dispatch that signal's events.
+    pub recorders: &'a mut Recorders,
 }
 
 /// One telemetry signal's userspace half. See the module docs for the

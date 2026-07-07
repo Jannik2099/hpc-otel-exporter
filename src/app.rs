@@ -17,8 +17,8 @@ use log::info;
 use tokio::signal;
 
 use crate::cgroup::{CgroupMode, CgroupRegistry, CgroupView};
-use crate::collector::{BuildCtx, Collector};
-use crate::metrics::{self, IoCollector, MetadataCollector};
+use crate::collector::{BuildCtx, CHANNEL_CAPACITY, Collector};
+use crate::metrics::{self, IoCollector, MetadataCollector, Recorders};
 use crate::numa;
 use crate::profiling::CpuProfileCollector;
 use crate::telemetry;
@@ -214,10 +214,17 @@ async fn run_async(args: Args) -> Result<()> {
         args.drop_unhandled,
     ));
 
+    // The single shared metric-event channel: every metric collector's decode
+    // callback sends its tagged event here, and one record task (spawned below)
+    // drains it.
+    let (tx, rx) = tokio::sync::mpsc::channel::<metrics::MetricEvent>(CHANNEL_CAPACITY);
+    let mut recorders = Recorders::default();
+
     // Build one collector per enabled signal. Each opens + loads its own BPF
     // object (a disabled signal costs no verification and creates no maps),
-    // registers its per-NUMA-node rings with the shared drainer, and spawns its
-    // own record/periodic tasks. Nothing is attached yet.
+    // registers its per-NUMA-node rings with the shared drainer, and (for metric
+    // signals) registers its recording state on `recorders`. Nothing is attached
+    // yet.
     let mut drainer = numa::DrainerBuilder::new();
     let mut collectors: Vec<Box<dyn Collector>> = Vec::new();
     {
@@ -225,6 +232,8 @@ async fn run_async(args: Args) -> Result<()> {
             registry: Arc::clone(&registry),
             v1_hierarchy_id,
             drainer: &mut drainer,
+            events: tx,
+            recorders: &mut recorders,
         };
         for signal in &enabled {
             collectors.push(signal.build(&mut ctx, &args)?);
@@ -239,6 +248,11 @@ async fn run_async(args: Args) -> Result<()> {
         info!("eBPF programs attached!");
         return Ok(());
     }
+
+    // The single record task draining the shared channel: dispatches each event
+    // to the matching signal's recorder. Spawned before attach so it is ready to
+    // consume the very first event.
+    let record_task = tokio::spawn(recorders.run(rx));
 
     // Start the per-NUMA-node draining threads, then attach: every ring is
     // populated before any program can produce an event.
@@ -290,11 +304,12 @@ async fn run_async(args: Args) -> Result<()> {
     let _ = signal::ctrl_c().await;
     info!("Ctrl-C received, exiting...");
 
-    // Stop the shared timers and every collector's own tasks before the
-    // skeletons drop; the tasks hold only Arcs and fd-dup'd MapHandles
-    // (independent of the skels), so aborting is clean.
+    // Stop the shared timers, the shared record task, and every collector's own
+    // tasks before the skeletons drop; the tasks hold only Arcs and fd-dup'd
+    // MapHandles (independent of the skels), so aborting is clean.
     metrics_task.abort();
     cleanup_task.abort();
+    record_task.abort();
     for collector in collectors.iter() {
         collector.shutdown();
     }
