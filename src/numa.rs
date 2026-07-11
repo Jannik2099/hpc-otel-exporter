@@ -41,7 +41,7 @@ use tokio_util::sync::CancellationToken;
 /// `NUMA_RINGBUF_SIZE` in `src/bpf/numa_ringbuf.bpf.h`: the inner-map prototype
 /// is created at that size and the kernel's map-in-map compatibility check
 /// requires every inserted ring to match the prototype's metadata exactly.
-const RINGBUF_SIZE: u32 = 1 << 16; // 64KiB
+const RINGBUF_SIZE: u32 = 1 << 18; // 256KiB
 
 /// `BPF_F_NUMA_NODE` (uapi/linux/bpf.h): place the ring's pages on a specific
 /// NUMA node. Also the only flag `BPF_MAP_TYPE_RINGBUF` permits, so the per-node
