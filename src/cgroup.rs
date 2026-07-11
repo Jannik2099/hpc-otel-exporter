@@ -230,6 +230,10 @@ pub struct CgroupRegistry {
     root: PathBuf,
     resource: Resource,
     exporter: SharedExporter,
+    /// Per-export timeout applied to each cgroup's OTLP export in
+    /// [`collect_and_export_all`](Self::collect_and_export_all), from
+    /// `OTEL_METRIC_EXPORT_TIMEOUT`. Read once at startup.
+    export_timeout: Duration,
     /// Per-provider metric views contributed by features (see [`CgroupView`]),
     /// applied to each cgroup's provider as it is created.
     views: Vec<CgroupView>,
@@ -274,6 +278,7 @@ impl CgroupRegistry {
             root,
             resource: build_resource(),
             exporter: SharedExporter(Arc::new(exporter)),
+            export_timeout: crate::telemetry::metrics_export_timeout(),
             views,
             filters,
             drop_unhandled,
@@ -543,20 +548,28 @@ impl CgroupRegistry {
     }
 
     /// Collect every live cgroup's [`ManualReader`] and push it through the shared
-    /// OTLP exporter, each cgroup in its own tokio task. Driven by a single timer in
-    /// [`crate::app`], this replaces the per-provider background threads a
-    /// [`PeriodicReader`] would otherwise spawn.
+    /// OTLP exporter, each cgroup in its own tokio task, and await them all. Driven
+    /// by a single timer in [`crate::app`], this replaces the per-provider background
+    /// threads a [`PeriodicReader`] would otherwise spawn.
+    ///
+    /// The cgroups export in parallel, but the returned future only completes once
+    /// every export has finished (or timed out), so the caller's timer sees export
+    /// backpressure the way the standard [`PeriodicReader`] does, rather than firing
+    /// and forgetting. Each individual export is bounded by `OTEL_METRIC_EXPORT_TIMEOUT`
+    /// (see [`export_timeout`](Self::export_timeout)).
     ///
     /// [`PeriodicReader`]: opentelemetry_sdk::metrics::PeriodicReader
-    pub fn collect_and_export_all(&self) {
+    pub async fn collect_and_export_all(&self) {
         // Snapshot the providers so we hold no DashMap guard while spawning (a guard
         // held across the spawned tasks' work risks deadlocking `get_or_create`).
         let cgroups: Vec<Arc<CgroupMeter>> =
             self.cgroups.iter().map(|e| Arc::clone(e.value())).collect();
 
+        let mut handles = Vec::with_capacity(cgroups.len());
         for cg in cgroups {
             let exporter = self.exporter.clone();
-            tokio::spawn(async move {
+            let timeout = self.export_timeout;
+            handles.push(tokio::spawn(async move {
                 let mut rm = ResourceMetrics::default();
                 match cg.reader.collect(&mut rm) {
                     Err(e) => log::warn!("Failed to collect metrics for cgroup {}: {e}", cg.name),
@@ -565,17 +578,22 @@ impl CgroupRegistry {
                     Ok(()) if rm.scope_metrics().next().is_none() => {}
                     Ok(()) => {
                         let start = Instant::now();
-                        let result = exporter.export(&rm).await;
+                        let result = tokio::time::timeout(timeout, exporter.export(&rm)).await;
                         let elapsed = start.elapsed();
                         match result {
+                            Err(_) => log::warn!(
+                                "Metric export for cgroup {} timed out after {:.1}s",
+                                cg.name,
+                                elapsed.as_secs_f64()
+                            ),
                             // Flag a slow-but-successful export
-                            Ok(()) if elapsed >= SLOW_EXPORT_THRESHOLD => log::warn!(
+                            Ok(Ok(())) if elapsed >= SLOW_EXPORT_THRESHOLD => log::warn!(
                                 "Slow metric export for cgroup {} took {:.1}s",
                                 cg.name,
                                 elapsed.as_secs_f64()
                             ),
-                            Ok(()) => {}
-                            Err(e) => log::warn!(
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => log::warn!(
                                 "Failed to export metrics for cgroup {} after {:.1}s: {e}",
                                 cg.name,
                                 elapsed.as_secs_f64()
@@ -583,7 +601,16 @@ impl CgroupRegistry {
                         }
                     }
                 }
-            });
+            }));
+        }
+
+        // Await every per-cgroup export so the caller's export tick reflects the true
+        // time taken; a panicking task (JoinError) is logged and otherwise ignored so
+        // one bad cgroup can't sink the whole tick.
+        for handle in handles {
+            if let Err(e) = handle.await {
+                log::warn!("Metric export task failed to join: {e}");
+            }
         }
     }
 }

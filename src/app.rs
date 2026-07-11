@@ -92,10 +92,6 @@ pub struct Args {
     #[arg(long, default_value_t = 5)]
     profile_interval_secs: u64,
 
-    /// Interval in seconds between collecting and exporting metrics
-    #[arg(long, default_value_t = 5)]
-    metrics_interval_secs: u64,
-
     /// Base URL of the Pyroscope ingest endpoint
     #[arg(long, default_value = "http://localhost:4040")]
     pyroscope_url: String,
@@ -271,14 +267,14 @@ async fn run_async(args: Args) -> Result<()> {
     // the shared OTLP exporter, on one timer for all collectors.
     let metrics_task = tokio::spawn({
         let registry = Arc::clone(&registry);
-        let mut interval =
-            tokio::time::interval(Duration::from_secs(args.metrics_interval_secs.max(1)));
+        let mut interval = tokio::time::interval(telemetry::metrics_export_interval());
+        // Like the standard PeriodicReader,
+        // wait a full interval after an export finishes.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         async move {
             loop {
                 interval.tick().await;
-                // Returns immediately after spawning one export task per cgroup, so a
-                // slow export never delays the next tick.
-                registry.collect_and_export_all();
+                registry.collect_and_export_all().await;
             }
         }
     });
