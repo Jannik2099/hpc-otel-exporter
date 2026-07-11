@@ -307,7 +307,7 @@ int BPF_PROG(meta_vfs_mknod_exit) {
     return 0;
 }
 
-// stat: vfs_getattr(const struct path *path, ...).
+// stat family (stat/lstat/fstat/fstatat/statx):
 SEC("fentry/vfs_getattr")
 int BPF_PROG(meta_vfs_getattr_entry, const struct path *path) {
     meta_start(METADATA_OP_GETATTR, path->dentry);
@@ -315,6 +315,16 @@ int BPF_PROG(meta_vfs_getattr_entry, const struct path *path) {
 }
 SEC("fexit/vfs_getattr")
 int BPF_PROG(meta_vfs_getattr_exit) {
+    meta_end(METADATA_OP_GETATTR, ctx);
+    return 0;
+}
+SEC("fentry/vfs_getattr_nosec")
+int BPF_PROG(meta_vfs_getattr_nosec_entry, const struct path *path) {
+    meta_start(METADATA_OP_GETATTR, path->dentry);
+    return 0;
+}
+SEC("fexit/vfs_getattr_nosec")
+int BPF_PROG(meta_vfs_getattr_nosec_exit) {
     meta_end(METADATA_OP_GETATTR, ctx);
     return 0;
 }
