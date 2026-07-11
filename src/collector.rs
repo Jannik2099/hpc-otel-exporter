@@ -34,7 +34,7 @@ use crate::numa::DrainerBuilder;
 /// the per-node draining threads and the record task. On overflow events are
 /// dropped (and counted per signal) rather than blocking the draining thread —
 /// the same drop-on-full behaviour the kernel ring buffer already has.
-pub const CHANNEL_CAPACITY: usize = 1 << 16;
+pub const CHANNEL_CAPACITY: usize = 1 << 18;
 
 /// An owned, boxed future, so [`Collector`] stays object-safe without an
 /// `async-trait` dependency.
