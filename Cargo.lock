@@ -230,13 +230,14 @@ checksum = "84d7ced0ae9557296835c32bf1b1e02b44c746701f898460fb000d7eaa84f00a"
 
 [[package]]
 name = "blazesym"
-version = "0.2.4"
-source = "git+https://github.com/libbpf/blazesym.git?rev=698820cb1be68ef59487e02976b3817e3a297f93#698820cb1be68ef59487e02976b3817e3a297f93"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df2dad0db4ca8b915bed561903b289b3881ef809307f810b2250aa56bd537a42"
 dependencies = [
  "cpp_demangle",
  "crc32fast",
  "flate2",
- "gimli 0.33.0",
+ "gimli 0.33.1",
  "libc",
  "memmap2",
  "rustc-demangle",
@@ -678,7 +679,7 @@ dependencies = [
  "arrayvec",
  "cfg-if",
  "fallible-iterator",
- "gimli 0.33.0",
+ "gimli 0.33.1",
  "macho-unwind-info",
  "pe-unwind-info",
 ]
@@ -809,11 +810,11 @@ checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
 name = "gimli"
-version = "0.33.0"
-source = "git+https://github.com/Jannik2099/gimli.git?rev=da55014d4d616ffe438f8abf834e9b0c8fcf8a44#da55014d4d616ffe438f8abf834e9b0c8fcf8a44"
+version = "0.33.1"
+source = "git+https://github.com/Jannik2099/gimli.git?rev=b6a29d5900886ac11a63686e5af5d1031406225b#b6a29d5900886ac11a63686e5af5d1031406225b"
 dependencies = [
  "fnv",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
  "indexmap",
  "stable_deref_trait",
 ]
@@ -897,7 +898,7 @@ dependencies = [
  "dashmap",
  "env_logger",
  "flate2",
- "gimli 0.33.0",
+ "gimli 0.33.1",
  "libbpf-cargo",
  "libbpf-rs",
  "libbpf-sys",
