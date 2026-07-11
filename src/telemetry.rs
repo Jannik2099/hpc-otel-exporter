@@ -4,6 +4,7 @@
 //! [`crate::cgroup`]; the IO and profiling features build their own instruments.
 
 use std::ffi::CStr;
+use std::time::Duration;
 
 use opentelemetry::trace::TracerProvider;
 use opentelemetry::{Key, KeyValue};
@@ -48,6 +49,43 @@ pub(crate) fn build_resource() -> Resource {
     .map(|key| KeyValue::new(key, hostname.clone()));
 
     Resource::builder().with_attributes(fallback).build()
+}
+
+/// The standard OTel SDK default for `OTEL_METRIC_EXPORT_INTERVAL` (60s), per
+/// <https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/>.
+const DEFAULT_METRIC_EXPORT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The standard OTel SDK default for `OTEL_METRIC_EXPORT_TIMEOUT` (30s), per
+/// <https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/>.
+const DEFAULT_METRIC_EXPORT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Read a `Duration` from the standardized OTel env var `name`, whose value is a
+/// count of milliseconds, falling back to `default` when unset. Panics on a value
+/// that isn't a valid number, to fail fast at startup rather than silently ignore a
+/// misconfiguration.
+fn duration_from_env_millis(name: &str, default: Duration) -> Duration {
+    match std::env::var(name) {
+        Ok(val) => match val.parse::<u64>() {
+            Ok(ms) => Duration::from_millis(ms.max(1)),
+            Err(_) => panic!("{name}={val:?} is not a valid number of milliseconds"),
+        },
+        Err(_) => default,
+    }
+}
+
+/// The interval between metrics collection/export ticks, taken from the
+/// standardized `OTEL_METRIC_EXPORT_INTERVAL` env var (milliseconds).
+pub(crate) fn metrics_export_interval() -> Duration {
+    duration_from_env_millis(
+        "OTEL_METRIC_EXPORT_INTERVAL",
+        DEFAULT_METRIC_EXPORT_INTERVAL,
+    )
+}
+
+/// The per-export timeout applied to each cgroup's OTLP metric export, taken from
+/// the standardized `OTEL_METRIC_EXPORT_TIMEOUT` env var (milliseconds).
+pub(crate) fn metrics_export_timeout() -> Duration {
+    duration_from_env_millis("OTEL_METRIC_EXPORT_TIMEOUT", DEFAULT_METRIC_EXPORT_TIMEOUT)
 }
 
 /// TLS config for the OTLP/gRPC exporters. opentelemetry-otlp auto-enables TLS for
