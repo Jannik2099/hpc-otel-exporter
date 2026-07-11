@@ -88,10 +88,10 @@ struct MetadataCgroup {
 /// Provider lifetime is owned by the shared [`CgroupRegistry`]; this type holds
 /// the instrument (via a [`PerCgroup`]) and its bound attribute sets, and prunes
 /// them via [`retain_live`](Self::retain_live) when the registry reports a cgroup
-/// gone. The bound sets are keyed by `(cgroup_id, op, fs_magic, error)`.
+/// gone. The bound sets are keyed by `(cgroup_id, op, fs_magic)`.
 pub struct MetadataMetrics {
     cgroups: PerCgroup<MetadataCgroup>,
-    attrs_to_metrics: DashMap<(u64, u32, u64, bool), BoundHistogram<u64>, FxBuildHasher>,
+    attrs_to_metrics: DashMap<(u64, u32, u64), BoundHistogram<u64>, FxBuildHasher>,
 }
 
 impl MetadataMetrics {
@@ -139,7 +139,6 @@ impl MetadataMetrics {
 
         let op = event.op as u32;
         let fs_magic = event.fs_magic as u64;
-        let error = event.error != 0;
 
         // Key bound attribute sets by the canonical (job-aggregated) cgroup id, not
         // the raw event id, so a SLURM job's sub-cgroups share one series.
@@ -147,13 +146,12 @@ impl MetadataMetrics {
 
         let histogram = self
             .attrs_to_metrics
-            .entry((cgroup_id, op, fs_magic, error))
+            .entry((cgroup_id, op, fs_magic))
             .or_insert_with(|| {
                 let mut attrs = vec![
                     KeyValue::new("vfs.op", event.op.as_str()),
                     KeyValue::new("cgroup.name", metrics.meter.name.clone()),
                     KeyValue::new("fs.magic", format!("{:#x}", fs_magic)),
-                    KeyValue::new("error", error),
                 ];
                 if let Some(fs_name) = event.fs_magic.magic_to_pretty_name() {
                     attrs.push(KeyValue::new("fs.type", fs_name));
@@ -174,7 +172,7 @@ impl MetadataMetrics {
     pub fn retain_live(&self, live: &FxHashSet<u64>) {
         self.cgroups.retain_live(live);
         self.attrs_to_metrics
-            .retain(|(cgroup_id, _, _, _), _| live.contains(cgroup_id));
+            .retain(|(cgroup_id, _, _), _| live.contains(cgroup_id));
     }
 }
 
