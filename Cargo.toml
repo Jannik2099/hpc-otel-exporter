@@ -60,7 +60,10 @@ memmap2 = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tcmalloc-better = { version = "0.1.19", optional = true }
-nix = { version = "0.31.3", features = ["user"], default-features = false }
+nix = { version = "0.31.3", features = [
+    "user",
+    "fs",
+], default-features = false }
 
 [patch.crates-io]
 gimli = { git = "https://github.com/Jannik2099/gimli.git", rev = "b6a29d5900886ac11a63686e5af5d1031406225b" }
