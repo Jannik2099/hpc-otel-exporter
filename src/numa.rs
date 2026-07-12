@@ -67,14 +67,20 @@ const BATCH_CAP: usize = RINGBUF_SIZE as usize / std::mem::size_of::<MetricEvent
 pub type DecodeFn<T> = Arc<dyn Fn(&[u8]) -> Option<T> + Send + Sync>;
 
 /// Decode a POD event `T` from a raw ring payload, or `None` when the payload
-/// is too short. Reads unaligned: ring slices carry no alignment guarantee.
+/// is too short. Reads aligned: ring slices are 8B aligned.
 pub fn decode_event<T: Copy>(data: &[u8]) -> Option<T> {
+    const {
+        assert!(
+            align_of::<T>() <= 8,
+            "decode_event<T>: align_of::<T>() must be <= 8"
+        )
+    };
     if data.len() < size_of::<T>() {
         return None;
     }
     // Safety: length checked above, and the BPF side only ever submits a `T`
     // into the ring this callback was registered for.
-    Some(unsafe { (data.as_ptr() as *const T).read_unaligned() })
+    Some(unsafe { (data.as_ptr() as *const T).read() })
 }
 
 /// A NUMA node and the CPUs that belong to it.
