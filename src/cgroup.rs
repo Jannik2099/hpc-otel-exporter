@@ -306,11 +306,7 @@ impl CgroupRegistry {
     /// whose inodes never match the v2 id), dominates the event-processing cost.
     /// Callers without a task in hand (e.g. profile draining) pass `None` and fall
     /// back to the walk.
-    pub async fn get_or_create(
-        &self,
-        cgroup_id: u64,
-        tgid: Option<u32>,
-    ) -> Option<Arc<CgroupMeter>> {
+    pub fn get_or_create(&self, cgroup_id: u64, tgid: Option<u32>) -> Option<Arc<CgroupMeter>> {
         // Fast path: a raw event id we've already mapped to its canonical tracked
         // cgroup. Drop the `Ref` before touching `cgroups` to keep it short.
         if let Some(canonical) = self.raw_to_canonical.get(&cgroup_id).map(|r| *r)
@@ -324,7 +320,7 @@ impl CgroupRegistry {
 
         // Resolve the leaf cgroup's path, then fold it onto its canonical (SLURM
         // job, or itself) tracked cgroup.
-        let leaf = match self.resolve_leaf(cgroup_id, tgid).await {
+        let leaf = match self.resolve_leaf(cgroup_id, tgid) {
             LeafResolution::Path(path) => path,
             // Root or no matching inode in the tree (dead): remember it so the next
             // event from the same id is rejected without redoing the work (until the
@@ -343,7 +339,7 @@ impl CgroupRegistry {
         // Run the cgroup filters and resolve the canonical id. A filter may
         // drop the cgroup (cacheable), or stat'ing a coalesce target may fail
         // (a transient race, not cacheable).
-        let info = match self.canonicalize(&leaf, cgroup_id).await {
+        let info = match self.canonicalize(&leaf, cgroup_id) {
             Canonicalized::Resolved(info) => info,
             Canonicalized::Dropped => {
                 self.unresolved.insert(cgroup_id);
@@ -368,10 +364,10 @@ impl CgroupRegistry {
     /// preferring the cheap `/proc/<tgid>/cgroup` read when a `tgid` hint is
     /// available and only walking the tracked mount as a fallback (no hint, e.g.
     /// the profiler). The path is verified to actually have inode `cgroup_id`.
-    async fn resolve_leaf(&self, cgroup_id: u64, tgid: Option<u32>) -> LeafResolution {
+    fn resolve_leaf(&self, cgroup_id: u64, tgid: Option<u32>) -> LeafResolution {
         match tgid {
-            Some(tgid) => self.resolve_leaf_via_proc(cgroup_id, tgid).await,
-            None => self.resolve_leaf_via_walk(cgroup_id).await,
+            Some(tgid) => self.resolve_leaf_via_proc(cgroup_id, tgid),
+            None => self.resolve_leaf_via_walk(cgroup_id),
         }
     }
 
@@ -379,11 +375,11 @@ impl CgroupRegistry {
     /// (`0::<path>` for v2, the `cpu`-controller line for v1), anchor it under the
     /// tracked mount, and confirm the directory's inode is in fact `cgroup_id`
     /// (guarding against the task migrating cgroups between the eBPF event and now).
-    async fn resolve_leaf_via_proc(&self, cgroup_id: u64, tgid: u32) -> LeafResolution {
+    fn resolve_leaf_via_proc(&self, cgroup_id: u64, tgid: u32) -> LeafResolution {
         use std::os::unix::fs::MetadataExt;
 
         // The hinting task has exited (or /proc is unreadable): can't confirm.
-        let Ok(content) = tokio::fs::read_to_string(format!("/proc/{tgid}/cgroup")).await else {
+        let Ok(content) = std::fs::read_to_string(format!("/proc/{tgid}/cgroup")) else {
             return LeafResolution::Unconfirmed;
         };
         let Some(rel) = self.proc_cgroup_path(&content) else {
@@ -396,7 +392,7 @@ impl CgroupRegistry {
         }
         let full = self.root.join(rel.trim_start_matches('/'));
 
-        let Ok(meta) = tokio::fs::metadata(&full).await else {
+        let Ok(meta) = std::fs::metadata(&full) else {
             return LeafResolution::Unconfirmed;
         };
         if meta.ino() != cgroup_id {
@@ -407,8 +403,8 @@ impl CgroupRegistry {
     }
 
     /// Walk the tracked mount for the directory whose inode is `cgroup_id`.
-    async fn resolve_leaf_via_walk(&self, cgroup_id: u64) -> LeafResolution {
-        match find_cgroup_path(&self.root, cgroup_id).await {
+    fn resolve_leaf_via_walk(&self, cgroup_id: u64) -> LeafResolution {
+        match find_cgroup_path(&self.root, cgroup_id) {
             // The mount root itself: the root cgroup, no usable name.
             Some(path) if path == self.root => LeafResolution::Unnameable,
             Some(path) => LeafResolution::Path(path),
@@ -439,7 +435,7 @@ impl CgroupRegistry {
     /// (e.g. a SLURM job, or a user's `user-<uid>.slice`), or drop the cgroup.
     /// That ancestor dir is stat'd for the canonical inode.
     /// With no filter matching, the leaf is tracked as itself (canonical id = `raw_id`).
-    async fn canonicalize(&self, leaf: &Path, raw_id: u64) -> Canonicalized {
+    fn canonicalize(&self, leaf: &Path, raw_id: u64) -> Canonicalized {
         use std::os::unix::fs::MetadataExt;
 
         // Path relative to the tracked mount - what filters match against, and the
@@ -462,7 +458,7 @@ impl CgroupRegistry {
         let canonical_id = if outcome.path == rel {
             raw_id
         } else {
-            match tokio::fs::metadata(self.root.join(&outcome.path)).await {
+            match std::fs::metadata(self.root.join(&outcome.path)) {
                 Ok(meta) => meta.ino(),
                 // Coalesce target vanished mid-resolve: retry next event.
                 Err(_) => return Canonicalized::Transient,
@@ -632,10 +628,10 @@ impl CgroupRegistry {
 /// state from it on first sight; [`retain_live`](Self::retain_live) drops the state
 /// of cgroups absent from the registry's liveness snapshot.
 ///
-/// Backed by a [`DashMap`] so features can record from a `&self` hot path. **Never
-/// hold a returned [`Ref`]/[`RefMut`] across an `.await`** — that risks a deadlock.
-/// `get_or_create` upholds this itself: it awaits the registry *before* touching
-/// its own map, so it never holds its own guard across the await.
+/// Backed by a [`DashMap`] so features can record from a `&self` hot path.
+/// Resolution and recording are fully synchronous, so the record path never awaits.
+/// **Never hold a returned [`Ref`]/[`RefMut`] across an `.await`**:
+///  that risks a deadlock if a caller ever bridges these guards into async code.
 pub struct PerCgroup<T> {
     registry: Arc<CgroupRegistry>,
     map: DashMap<u64, T, FxBuildHasher>,
@@ -669,7 +665,7 @@ impl<T> PerCgroup<T> {
     ///
     /// `tgid` is the [resolution hint](CgroupRegistry::get_or_create) forwarded to
     /// the registry: pass the id of the task the event came from when known.
-    pub async fn get_or_create<F>(
+    pub fn get_or_create<F>(
         &self,
         id: u64,
         tgid: Option<u32>,
@@ -680,9 +676,8 @@ impl<T> PerCgroup<T> {
     {
         // Resolve (and canonicalize) through the registry first — its raw->canonical
         // cache makes the steady state an O(1) lookup — then key our own map by the
-        // canonical id. Awaiting before touching the map upholds the never-hold-a-
-        // guard-across-await invariant.
-        let meter = self.registry.get_or_create(id, tgid).await?;
+        // canonical id.
+        let meter = self.registry.get_or_create(id, tgid)?;
         Some(self.map.entry(meter.id).or_insert_with(|| init(&meter)))
     }
 
@@ -821,28 +816,23 @@ fn parse_cpu_v1_mount(mountinfo: &str) -> Option<PathBuf> {
 /// searched: on a hybrid layout the v1 controller trees and the v2 tree are
 /// separate kernfs filesystems whose inode spaces collide, and searching the
 /// wrong one would name a different cgroup.
-async fn find_cgroup_path(root: &Path, id: u64) -> Option<PathBuf> {
-    // cgroupfs is kernfs (in-kernel, effectively non-blocking), so the whole walk
-    // runs synchronously on one blocking thread rather than through `tokio::fs`,
-    // which dispatches every syscall through its own `spawn_blocking` round-trip.
-    // We drive `readdir`/`openat` directly rather than via `std::fs` or `nix`'s
-    // `Dir`: both heap-allocate an owned copy of every entry's name (a `CString`
-    // they must copy to satisfy `Iterator`), and that copy dominates this walk's
-    // allocations. `readdir` instead lets us borrow the name out of the `DIR`
-    // stream's own buffer, and `openat` descent means no path is ever built either.
+fn find_cgroup_path(root: &Path, id: u64) -> Option<PathBuf> {
+    // cgroupfs is kernfs (in-kernel, effectively non-blocking), so the walk runs
+    // synchronously right here rather than through `tokio::fs`, which dispatches
+    // every syscall through its own `spawn_blocking` round-trip. We drive
+    // `readdir`/`openat` directly rather than via `std::fs` or `nix`'s `Dir`: both
+    // heap-allocate an owned copy of every entry's name (a `CString` they must copy
+    // to satisfy `Iterator`), and that copy dominates this walk's allocations.
+    // `readdir` instead lets us borrow the name out of the `DIR` stream's own
+    // buffer, and `openat` descent means no path is ever built either.
     let root = root.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let fd = nix::fcntl::open(root.as_path(), DIR_OFLAGS, Mode::empty()).ok()?;
-        // The root has no parent `readdir` to hand us its inode, so `fstat` it once.
-        if fstat(fd.as_fd()).map(|s| s.st_ino).ok() == Some(id) {
-            return Some(root);
-        }
-        let mut cur = root;
-        find_dir_by_inode(fd, id, &mut cur)
-    })
-    .await
-    .ok()
-    .flatten()
+    let fd = nix::fcntl::open(root.as_path(), DIR_OFLAGS, Mode::empty()).ok()?;
+    // The root has no parent `readdir` to hand us its inode, so `fstat` it once.
+    if fstat(fd.as_fd()).map(|s| s.st_ino).ok() == Some(id) {
+        return Some(root);
+    }
+    let mut cur = root;
+    find_dir_by_inode(fd, id, &mut cur)
 }
 
 /// Depth-first search of the open directory `fd` and its subdirectories (reached via
@@ -1030,8 +1020,8 @@ mod tests {
     /// agree with the full-tree walk — the two resolvers have to find the same
     /// directory so they don't split a series. Skips on hosts without a v2
     /// hierarchy.
-    #[tokio::test]
-    async fn proc_resolution_matches_the_tree_walk_for_self() {
+    #[test]
+    fn proc_resolution_matches_the_tree_walk_for_self() {
         // Our own v2 cgroup id is the inode of the dir named by /proc/self/cgroup's
         // `0::` line under the cgroup2 mount.
         let Ok(content) = std::fs::read_to_string("/proc/self/cgroup") else {
@@ -1052,7 +1042,7 @@ mod tests {
         let cgroup_id = meta.ino();
 
         // The walk over the same mount must land on the same directory.
-        let via_walk = find_cgroup_path(mount, cgroup_id).await;
+        let via_walk = find_cgroup_path(mount, cgroup_id);
         assert_eq!(via_walk, Some(via_proc));
     }
 }

@@ -18,8 +18,9 @@
 //!
 //! The draining thread does only the NUMA-local work: on a fixed short interval
 //! it drains its node's rings a memory-only read, decoding each record and batching it,
-//! then flushes each batch down a bounded channel in one reserve
-//! (see [`POLL_INTERVAL`] and [`Flusher`]). Polling on a
+//! then flushes each batch down an array-backed (crossbeam) channel, whose
+//! `try_send` is an alloc-free atomic push (see [`POLL_INTERVAL`] and
+//! [`Flusher`]). Polling on a
 //! timer rather than waking on the ring's fd per event keeps drain CPU
 //! proportional to the poll rate, not the event rate, and lets the kernel skip
 //! wakeups entirely (the producers submit `BPF_RB_NO_WAKEUP`). Anything slow
@@ -40,9 +41,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::Result;
+use crossbeam_channel::Sender;
 use libbpf_rs::{MapCore, MapFlags, MapHandle, MapType, RingBuffer, RingBufferBuilder};
 use log::{error, info, warn};
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::metrics::MetricEvent;
@@ -66,7 +67,7 @@ const BATCH_CAP: usize = RINGBUF_SIZE as usize / std::mem::size_of::<MetricEvent
 /// memory-only read (no syscall), so draining on a timer, rather than waking on
 /// the ring's epoll fd per event, keeps drain-thread CPU proportional to the
 /// poll rate instead of the event rate, and lets each sweep drain a whole batch
-/// so the channel is reserved once per batch, not per event.
+/// in one pass rather than waking per event.
 /// 4ms with a ringbuf capacity of 4096 events can handle 1 million events/sec
 const POLL_INTERVAL: Duration = Duration::from_millis(4);
 
@@ -166,38 +167,29 @@ struct Flusher<T> {
 }
 
 impl<T> Flusher<T> {
-    /// Push the whole batch onto `sender` in one reserve, then clear it. On the
-    /// common path a single `try_reserve_many` acquires a permit for every
-    /// buffered item at once (one semaphore op for the batch instead of one per
-    /// event); when the channel is full it takes only what currently fits and
-    /// drops the tail, matching the ring buffer's own drop-on-full behaviour.
-    fn flush(&self, sender: &mpsc::Sender<T>) {
+    /// Push the whole batch onto `sender`, then clear it. `sender` is an
+    /// array-backed crossbeam channel: `try_send` is an alloc-free atomic push, so
+    /// there is no per-event allocation and no reason to reserve the batch up front
+    /// (unlike tokio's linked-list mpsc, whose 32-slot blocks were allocated and
+    /// freed under this bursty flush pattern). Events that don't fit are dropped
+    /// and counted, matching the ring buffer's own drop-on-full behaviour.
+    fn flush(&self, sender: &Sender<T>) {
         // Safety: `consume_raw` has returned, so no ring callback (the only other
         // accessor) is running. This is the buffer's sole live borrow.
         let buf = unsafe { self.buffer.get() };
-        let n = buf.len();
-        if n == 0 {
+        if buf.is_empty() {
             return;
         }
-        let permits = sender
-            .try_reserve_many(n)
-            // Channel full: reserve only what fits right now, drop the rest.
-            .or_else(|_| sender.try_reserve_many(n.min(sender.capacity())));
-        if let Ok(permits) = permits {
-            // `permits` holds exactly as many slots as were reserved; drain that
-            // many so the unsent tail stays in `buf` to be counted below (draining
-            // more than we send would silently discard events uncounted).
-            let take = permits.len();
-            for (permit, item) in permits.zip(buf.drain(..take)) {
-                permit.send(item);
+        let mut dropped = 0u64;
+        for item in buf.drain(..) {
+            // `try_send` returns the item inside the error; dropping the error
+            // drops the event, which is exactly the drop-on-full behaviour we want.
+            if sender.try_send(item).is_err() {
+                dropped += 1;
             }
         }
-        // Whatever's left (all of it if both reserves failed) had no room in the
-        // channel: count it as dropped and clear so the next batch starts empty.
-        let dropped = buf.len();
         if dropped > 0 {
-            self.dropped.fetch_add(dropped as u64, Ordering::Relaxed);
-            buf.clear();
+            self.dropped.fetch_add(dropped, Ordering::Relaxed);
         }
     }
 }
@@ -211,13 +203,13 @@ impl<T> Flusher<T> {
 pub struct DrainerBuilder<T> {
     nodes: Vec<NumaNode>,
     sources: Vec<Source<T>>,
-    sender: mpsc::Sender<T>,
+    sender: Sender<T>,
 }
 
 impl<T: Send + 'static> DrainerBuilder<T> {
     /// Enumerate the machine's NUMA topology; no rings exist yet. `sender` is the
     /// channel every draining thread's batch is flushed onto.
-    pub fn new(sender: mpsc::Sender<T>) -> Self {
+    pub fn new(sender: Sender<T>) -> Self {
         let nodes = numa_nodes();
         info!(
             "draining {} NUMA node ring buffer(s) ({} total)",
@@ -356,7 +348,7 @@ fn drain_node<T: 'static>(
     id: u32,
     cpus: &[usize],
     rings: Vec<NodeSource<T>>,
-    sender: mpsc::Sender<T>,
+    sender: Sender<T>,
     stop: &CancellationToken,
 ) {
     pin_to_cpus(id, cpus);
@@ -400,12 +392,12 @@ fn drain_node<T: 'static>(
 /// Drain `ring_buffer` on a fixed poll interval until `stop` is cancelled.
 /// `consume_raw` is a memory-only read (no syscall) that drains every event that
 /// has accumulated since the last sweep into the sources' batch buffers, which
-/// are then flushed down `sender` in one reserve each; sleeping [`POLL_INTERVAL`]
+/// are then flushed down `sender` (one alloc-free `try_send` per event); sleeping [`POLL_INTERVAL`]
 /// between sweeps lets a whole batch build up rather than waking per event.
 /// `stop` is checked once per interval, so shutdown lands within one interval.
 fn drain_loop<T>(
     ring_buffer: &RingBuffer<'_>,
-    sender: &mpsc::Sender<T>,
+    sender: &Sender<T>,
     flushers: &[Flusher<T>],
     stop: &CancellationToken,
 ) {

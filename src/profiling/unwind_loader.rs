@@ -230,7 +230,6 @@ impl UnwindLoader {
             .cgroup_metrics
             .registry()
             .get_or_create(cgroup_id, Some(pid))
-            .await
         else {
             return;
         };
@@ -371,10 +370,9 @@ impl UnwindLoader {
         // known tracked here (resolved above), so `get_or_create` is a registry
         // cache hit that lazily builds this cgroup's `UnwindMetrics` on first load.
         if let Some((libraries_read, libraries_failed)) = load
-            && let Some(metrics) = self
-                .cgroup_metrics
-                .get_or_create(cgroup_id, Some(pid), |meter| UnwindMetrics::new(meter))
-                .await
+            && let Some(metrics) =
+                self.cgroup_metrics
+                    .get_or_create(cgroup_id, Some(pid), |meter| UnwindMetrics::new(meter))
         {
             metrics.process_loads.add(1);
             metrics.libraries_read.add(libraries_read);

@@ -107,7 +107,7 @@ impl MetadataMetrics {
     /// Record a metadata event, lazily attaching the instrument to the cgroup's
     /// shared meter on first sight. Events in unresolvable or root cgroups (no
     /// meter) are dropped.
-    pub async fn record(&self, event: &bindings::MetadataEvent) {
+    pub fn record(&self, event: &bindings::MetadataEvent) {
         if event.fs_magic.is_ephemeral_fs() {
             return;
         }
@@ -125,9 +125,7 @@ impl MetadataMetrics {
                     meter: Arc::clone(meter),
                     duration_histogram,
                 }
-            })
-            .await
-        {
+            }) {
             Some(m) => m,
             None => return,
         };

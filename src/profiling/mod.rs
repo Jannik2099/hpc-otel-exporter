@@ -272,7 +272,6 @@ impl Profiler {
             let Some(cache) = self
                 .cgroups
                 .get_or_create(raw_id, None, |meter| CgroupCache::new(Arc::clone(meter)))
-                .await
             else {
                 continue;
             };

@@ -6,6 +6,7 @@ license = "GPL-3.0-or-later"
 
 [dependencies]
 anyhow = "1.0.101"
+crossbeam-channel = "0.5.16"
 dashmap = { version = "6.1.0", features = ["inline"] }
 env_logger = "0.11"
 libbpf-rs = "0.26.0"

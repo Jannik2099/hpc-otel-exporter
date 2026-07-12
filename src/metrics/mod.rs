@@ -4,10 +4,10 @@
 //! state (a [`PerCgroup`] of its instruments with a `record(event)` hot path
 //! and a `retain_live(&live)` pruner) and a `*Collector` — the signal's
 //! [`Collector`] implementation that owns the standalone eBPF object and its
-//! per-NUMA-node ring registration. All metric signals share **one** tokio mpsc
-//! queue and a single record task: each collector's decode callback tags its
-//! decoded event as a [`MetricEvent`] and sends it down the shared channel; the
-//! [`Recorders`] record loop (owned by [`crate::app`]) dispatches each event to
+//! per-NUMA-node ring registration. All metric signals share **one** array-backed
+//! (crossbeam) queue and a single record thread: each collector's decode callback
+//! tags its decoded event as a [`MetricEvent`] and sends it down the shared channel;
+//! the [`Recorders`] record loop (owned by [`crate::app`]) dispatches each event to
 //! the matching signal's `*Metrics::record`. Adding a metric signal means:
 //!
 //! 1. write the eBPF side: a standalone `src/bpf/<name>.bpf.c` object (add it
@@ -29,7 +29,7 @@ pub mod metadata;
 
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
+use crossbeam_channel::Receiver;
 
 use crate::bindings::{IOEvent, MetadataEvent};
 
@@ -56,22 +56,22 @@ pub struct Recorders {
 }
 
 impl Recorders {
-    /// Drain the shared channel in batches and dispatch each event to the
-    /// matching signal's recorder.
-    pub async fn run(self, mut rx: mpsc::Receiver<MetricEvent>) {
-        let mut batch = Vec::with_capacity(1024);
-        while rx.recv_many(&mut batch, 1024).await > 0 {
-            for event in batch.drain(..) {
-                match event {
-                    MetricEvent::Io(e) => {
-                        if let Some(m) = &self.io {
-                            m.record(&e).await;
-                        }
+    /// Drain the shared channel and dispatch each event to the matching signal's
+    /// recorder. Runs on a dedicated blocking thread (see [`crate::app`]): the
+    /// channel is an array-backed crossbeam queue whose `recv` never allocates.
+    /// Returns when every sender has dropped
+    /// (the draining threads have stopped) and the queue is drained.
+    pub fn run(self, rx: Receiver<MetricEvent>) {
+        while let Ok(event) = rx.recv() {
+            match event {
+                MetricEvent::Io(e) => {
+                    if let Some(m) = &self.io {
+                        m.record(&e);
                     }
-                    MetricEvent::Metadata(e) => {
-                        if let Some(m) = &self.metadata {
-                            m.record(&e).await;
-                        }
+                }
+                MetricEvent::Metadata(e) => {
+                    if let Some(m) = &self.metadata {
+                        m.record(&e);
                     }
                 }
             }
