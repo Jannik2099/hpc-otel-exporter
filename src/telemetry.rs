@@ -108,11 +108,26 @@ pub(crate) fn record_span_error(span: &tracing::Span, err: &impl std::fmt::Displ
 }
 
 /// Installs a global [`SdkTracerProvider`] exporting spans over OTLP/gRPC, so any
-/// code can create spans via [`opentelemetry::global::tracer`]. The returned
-/// guard must be kept alive for the process' lifetime; dropping it flushes and
-/// shuts the provider down so buffered spans are exported on a clean exit.
+/// code can create spans via [`opentelemetry::global::tracer`], and wires the
+/// `tracing` subscriber that feeds it. The returned guard must be kept alive for
+/// the process' lifetime; dropping it flushes and shuts the provider down so
+/// buffered spans are exported on a clean exit.
+///
+/// Honours the standardized `OTEL_TRACES_EXPORTER` env var: when it is set to
+/// `none`, neither the tracer provider nor the `tracing` subscriber is installed
+/// and `None` is returned, so tracing is entirely opt-out. Any other value (or
+/// unset) installs the OTLP exporter as usual.
 #[must_use = "spans stop being exported once the guard is dropped"]
-pub fn init_tracing() -> TracingGuard {
+pub fn init_tracing() -> Option<TracingGuard> {
+    // Per the OTel SDK spec, `OTEL_TRACES_EXPORTER=none` disables trace export.
+    // We only support the OTLP exporter, so treat every other value (including
+    // unset) as "install OTLP".
+    if let Ok(val) = std::env::var("OTEL_TRACES_EXPORTER")
+        && val.eq_ignore_ascii_case("none")
+    {
+        return None;
+    }
+
     let exporter = SpanExporter::builder()
         .with_tonic()
         .with_protocol(Protocol::Grpc)
@@ -139,7 +154,7 @@ pub fn init_tracing() -> TracingGuard {
     // pipelines on purpose.
     tracing::subscriber::set_global_default(subscriber)
         .expect("failed to set global default tracing subscriber");
-    TracingGuard(provider)
+    Some(TracingGuard(provider))
 }
 
 /// Flushes and shuts the global tracer provider down when dropped.
