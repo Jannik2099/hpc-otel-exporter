@@ -16,28 +16,32 @@
 //!     into the feature's outer array — done **before** the programs attach so
 //!     the very first event finds a ring for its node.
 //!
-//! The draining thread does only the NUMA-local work (`ring_buffer__poll` +
-//! the feature's decode callback, which typically forwards down a bounded
-//! channel); anything slow (e.g. `/proc` resolution) belongs on the feature's
-//! own task consuming that channel. Keeping the thread pinned to the producing
-//! node is the whole point — it ensures the ring's reserve/commit atomics and
-//! backing pages stay node-local.
+//! The draining thread does only the NUMA-local work: on a fixed short interval
+//! it drains its node's rings a memory-only read, decoding each record and batching it,
+//! then flushes each batch down a bounded channel in one reserve
+//! (see [`POLL_INTERVAL`] and [`Flusher`]). Polling on a
+//! timer rather than waking on the ring's fd per event keeps drain CPU
+//! proportional to the poll rate, not the event rate, and lets the kernel skip
+//! wakeups entirely (the producers submit `BPF_RB_NO_WAKEUP`). Anything slow
+//! (e.g. `/proc` resolution) belongs on the feature's own task consuming that
+//! channel. Keeping the thread pinned to the producing node is the whole point:
+//! it ensures the ring's reserve/commit atomics and backing pages stay
+//! node-local.
 //!
 //! [`register`]: DrainerBuilder::register
 
 use std::cell::UnsafeCell;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use anyhow::Result;
 use libbpf_rs::{MapCore, MapFlags, MapHandle, MapType, RingBuffer, RingBufferBuilder};
 use log::{error, info, warn};
-use tokio::io::Interest;
-use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -57,6 +61,14 @@ const BPF_F_NUMA_NODE: u32 = 1 << 2;
 /// Pre-reserved capacity for a draining thread's per-source batch buffer: an
 /// upper bound on the records one `consume_raw` can yield from a single ring.
 const BATCH_CAP: usize = RINGBUF_SIZE as usize / std::mem::size_of::<MetricEvent>();
+
+/// How long a draining thread sleeps between drains. `consume_raw` is a
+/// memory-only read (no syscall), so draining on a timer, rather than waking on
+/// the ring's epoll fd per event, keeps drain-thread CPU proportional to the
+/// poll rate instead of the event rate, and lets each sweep drain a whole batch
+/// so the channel is reserved once per batch, not per event.
+/// 4ms with a ringbuf capacity of 4096 events can handle 1 million events/sec
+const POLL_INTERVAL: Duration = Duration::from_millis(4);
 
 /// A feature's decode callback, run on the draining thread for every raw ring
 /// payload: turn one raw ring record into a buffered item `T` (or `None` when
@@ -382,62 +394,30 @@ fn drain_node<T: 'static>(
         }
     };
 
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            error!("node {id}: failed to build tokio runtime: {e}");
-            return;
-        }
-    };
-    runtime.block_on(drain_loop(id, &ring_buffer, &sender, &flushers, stop));
+    drain_loop(&ring_buffer, &sender, &flushers, stop);
 }
 
-/// Drain `ring_buffer` on the current-thread runtime: sleep in epoll on the
-/// ring's fd, and greedily `consume` whenever it becomes readable, until `stop`
-/// is cancelled. `consume` drains every pending event (the fd is edge-triggered,
-/// so a partial drain would leave events unwoken) into the sources' batch
-/// buffers, which are then flushed down `sender` in one reserve each.
-async fn drain_loop<T>(
-    id: u32,
+/// Drain `ring_buffer` on a fixed poll interval until `stop` is cancelled.
+/// `consume_raw` is a memory-only read (no syscall) that drains every event that
+/// has accumulated since the last sweep into the sources' batch buffers, which
+/// are then flushed down `sender` in one reserve each; sleeping [`POLL_INTERVAL`]
+/// between sweeps lets a whole batch build up rather than waking per event.
+/// `stop` is checked once per interval, so shutdown lands within one interval.
+fn drain_loop<T>(
     ring_buffer: &RingBuffer<'_>,
     sender: &mpsc::Sender<T>,
     flushers: &[Flusher<T>],
     stop: &CancellationToken,
 ) {
-    let epoll_fd = ring_buffer.epoll_fd();
-    let async_fd = match AsyncFd::with_interest(
-        unsafe { BorrowedFd::borrow_raw(epoll_fd) },
-        Interest::READABLE,
-    ) {
-        Ok(fd) => fd,
-        Err(e) => {
-            error!("node {id}: failed to register ring buffer epoll fd: {e}");
-            return;
+    while !stop.is_cancelled() {
+        // `consume_raw` has returned before we flush, so every ring callback has
+        // finished and released its buffer borrow: safe to touch the batches.
+        if ring_buffer.consume_raw() > 0 {
+            for flusher in flushers {
+                flusher.flush(sender);
+            }
         }
-    };
-
-    loop {
-        tokio::select! {
-            _ = stop.cancelled() => break,
-            _ = async_fd.async_io(Interest::READABLE, |_| {
-                let consumed = ring_buffer.consume_raw();
-                // `consume_raw` has returned, so every ring callback has finished
-                // and released its buffer borrow: safe to flush the batches now.
-                if consumed > 0 {
-                    for flusher in flushers {
-                        flusher.flush(sender);
-                    }
-                }
-                match consumed {
-                    n if n > 0 => Ok(n),
-                    0 => Err(std::io::ErrorKind::WouldBlock.into()),
-                    n => Err(std::io::Error::from_raw_os_error(-n)),
-                }
-            }) => {}
-        };
+        std::thread::sleep(POLL_INTERVAL);
     }
 }
 

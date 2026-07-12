@@ -105,7 +105,8 @@ static __always_inline void record_end(const struct file *file, const s64 bytes,
     event->pid = pid_tgid & 0xFFFFFFFF;
     event->tgid = pid_tgid >> 32;
 
-    bpf_ringbuf_submit(event, 0);
+    // NO_WAKEUP: userspace drains the ring on a timer (see src/numa.rs)
+    bpf_ringbuf_submit(event, BPF_RB_NO_WAKEUP);
 
     return;
 }

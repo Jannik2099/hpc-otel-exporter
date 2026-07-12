@@ -144,7 +144,8 @@ static __always_inline void meta_end(const enum MetadataOp op, void *ctx) {
     event->_pad[1] = 0;
     event->_pad[2] = 0;
 
-    bpf_ringbuf_submit(event, 0);
+    // NO_WAKEUP: userspace drains the ring on a timer (see src/numa.rs)
+    bpf_ringbuf_submit(event, BPF_RB_NO_WAKEUP);
 }
 
 // open: vfs_open(const struct path *path, struct file *file).
