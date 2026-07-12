@@ -19,9 +19,17 @@
 //! [`bpf_get_current_cgroup_id`]: https://docs.kernel.org/bpf/helpers.html
 //! [views]: opentelemetry_sdk::metrics::View
 
+use std::ffi::{CStr, OsStr};
+use std::ops::ControlFlow;
+use std::os::fd::{AsFd, BorrowedFd, IntoRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
+
+use nix::fcntl::OFlag;
+use nix::libc;
+use nix::sys::stat::{Mode, fstat};
 
 use dashmap::mapref::one::{Ref, RefMut};
 use dashmap::{DashMap, DashSet};
@@ -814,30 +822,53 @@ fn parse_cpu_v1_mount(mountinfo: &str) -> Option<PathBuf> {
 /// separate kernfs filesystems whose inode spaces collide, and searching the
 /// wrong one would name a different cgroup.
 async fn find_cgroup_path(root: &Path, id: u64) -> Option<PathBuf> {
-    use std::os::unix::fs::MetadataExt;
-
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(current) = stack.pop() {
-        let Ok(meta) = tokio::fs::metadata(&current).await else {
-            continue;
-        };
-        if meta.ino() == id {
-            return Some(current);
+    // cgroupfs is kernfs (in-kernel, effectively non-blocking), so the whole walk
+    // runs synchronously on one blocking thread rather than through `tokio::fs`,
+    // which dispatches every syscall through its own `spawn_blocking` round-trip.
+    // We drive `readdir`/`openat` directly rather than via `std::fs` or `nix`'s
+    // `Dir`: both heap-allocate an owned copy of every entry's name (a `CString`
+    // they must copy to satisfy `Iterator`), and that copy dominates this walk's
+    // allocations. `readdir` instead lets us borrow the name out of the `DIR`
+    // stream's own buffer, and `openat` descent means no path is ever built either.
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let fd = nix::fcntl::open(root.as_path(), DIR_OFLAGS, Mode::empty()).ok()?;
+        // The root has no parent `readdir` to hand us its inode, so `fstat` it once.
+        if fstat(fd.as_fd()).map(|s| s.st_ino).ok() == Some(id) {
+            return Some(root);
         }
+        let mut cur = root;
+        find_dir_by_inode(fd, id, &mut cur)
+    })
+    .await
+    .ok()
+    .flatten()
+}
 
-        let Ok(mut entries) = tokio::fs::read_dir(&current).await else {
-            continue;
-        };
-        while let Some(entry) = entries.next_entry().await.unwrap_or(None) {
-            let Ok(ft) = entry.file_type().await else {
-                continue;
-            };
-            if ft.is_dir() {
-                stack.push(entry.path());
-            }
+/// Depth-first search of the open directory `fd` and its subdirectories (reached via
+/// `openat`, so no intermediate path is ever materialized) for the directory whose
+/// inode is `id`. `cur` is `fd`'s path relative to the walk root, extended in place
+/// as the search descends and returned as the match's full path once found.
+fn find_dir_by_inode(fd: OwnedFd, id: u64, cur: &mut PathBuf) -> Option<PathBuf> {
+    let mut found = None;
+    for_each_subdir(fd, |dirfd, ino, name| {
+        if ino == id {
+            cur.push(OsStr::from_bytes(name.to_bytes()));
+            found = Some(std::mem::take(cur));
+            return ControlFlow::Break(());
         }
-    }
-    None
+        let Ok(child) = nix::fcntl::openat(dirfd, name, DIR_OFLAGS, Mode::empty()) else {
+            return ControlFlow::Continue(());
+        };
+        cur.push(OsStr::from_bytes(name.to_bytes()));
+        if let Some(f) = find_dir_by_inode(child, id, cur) {
+            found = Some(f);
+            return ControlFlow::Break(());
+        }
+        cur.pop();
+        ControlFlow::Continue(())
+    });
+    found
 }
 
 /// Collect the inodes of every directory under the tracked hierarchy's mount
@@ -849,32 +880,101 @@ pub(crate) async fn collect_live_cgroup_ids(root: &Path) -> FxHashSet<u64> {
 }
 
 async fn walk_cgroup_dir(dir: &Path) -> FxHashSet<u64> {
-    use std::os::unix::fs::MetadataExt;
-
-    let mut ids = FxHashSet::default();
-    let mut stack: Vec<PathBuf> = vec![dir.to_path_buf()];
-
-    while let Some(current) = stack.pop() {
-        let Ok(meta) = tokio::fs::metadata(&current).await else {
-            continue;
+    // See `find_cgroup_path`: a synchronous `readdir`/`openat` walk on one blocking
+    // thread, avoiding both `tokio::fs`'s per-call `spawn_blocking` and the per-entry
+    // name allocation of `std::fs`/`nix`.
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut ids = FxHashSet::default();
+        let Ok(fd) = nix::fcntl::open(dir.as_path(), DIR_OFLAGS, Mode::empty()) else {
+            return ids;
         };
-        ids.insert(meta.ino());
+        // The root's inode isn't handed to us by any parent `readdir`, so `fstat` it
+        // once; every descendant's inode comes from its parent's `readdir`.
+        if let Ok(st) = fstat(fd.as_fd()) {
+            ids.insert(st.st_ino);
+        }
+        collect_dir_inodes(fd, &mut ids);
+        ids
+    })
+    .await
+    .unwrap_or_default()
+}
 
-        let Ok(mut entries) = tokio::fs::read_dir(&current).await else {
+/// Recursively insert the inode of every subdirectory of the open directory `fd`,
+/// descending via `openat` so no path is ever built (only inodes are needed).
+fn collect_dir_inodes(fd: OwnedFd, ids: &mut FxHashSet<u64>) {
+    for_each_subdir(fd, |dirfd, ino, name| {
+        // The inode comes straight from `readdir`; no per-directory `stat`.
+        ids.insert(ino);
+        if let Ok(child) = nix::fcntl::openat(dirfd, name, DIR_OFLAGS, Mode::empty()) {
+            collect_dir_inodes(child, ids);
+        }
+        ControlFlow::Continue(())
+    });
+}
+
+/// Drive `readdir` over the directory `fd` (whose ownership this takes), invoking
+/// `f(dirfd, ino, name)` for each subdirectory entry, skipping non-directories and
+/// the `.`/`..` links, until `f` breaks or the directory ends.
+///
+/// `readdir` returns pointers into the `DIR` stream's own buffer, so `name` borrows
+/// that buffer with no per-entry allocation; `dirfd` is the stream's fd, for `f` to
+/// `openat` the child and recurse. Each recursion level opens a distinct stream, so
+/// the borrowed `name` stays valid across the descent (this stream isn't advanced
+/// until `f` returns).
+fn for_each_subdir<F>(fd: OwnedFd, mut f: F)
+where
+    F: FnMut(BorrowedFd, u64, &CStr) -> ControlFlow<()>,
+{
+    // `fdopendir` adopts the fd and `closedir` will close it, so hand off ownership
+    // (leak the `OwnedFd`) to avoid a double close.
+    let raw = fd.into_raw_fd();
+    let dirp = unsafe { libc::fdopendir(raw) };
+    if dirp.is_null() {
+        // Ownership never transferred; close the fd ourselves.
+        unsafe { libc::close(raw) };
+        return;
+    }
+    // Borrowed for `f`'s `openat`; valid until `closedir` below.
+    let dirfd = unsafe { BorrowedFd::borrow_raw(libc::dirfd(dirp)) };
+    loop {
+        // NULL is end-of-directory or an error (distinguished only by errno);
+        // for a best-effort liveness walk we stop on either.
+        let de = unsafe { libc::readdir(dirp) };
+        if de.is_null() {
+            break;
+        }
+        // kernfs always fills `d_type`, so `DT_UNKNOWN` never arises for cgroupfs.
+        if unsafe { (*de).d_type } != libc::DT_DIR {
             continue;
-        };
-        while let Some(entry) = entries.next_entry().await.unwrap_or(None) {
-            let Ok(ft) = entry.file_type().await else {
-                continue;
-            };
-            if ft.is_dir() {
-                stack.push(entry.path());
-            }
+        }
+        // `d_name` is a NUL-terminated array embedded in the `dirent`; borrow it.
+        let name = unsafe { CStr::from_ptr((*de).d_name.as_ptr()) };
+        if is_dot(name) {
+            continue;
+        }
+        let ino = unsafe { (*de).d_ino };
+        if f(dirfd, ino, name).is_break() {
+            break;
         }
     }
-
-    ids
+    unsafe { libc::closedir(dirp) };
 }
+
+/// The `.`/`..` self and parent links every `readdir` yields, which must be skipped
+/// so the walk neither loops on `.` nor escapes upward through `..`.
+fn is_dot(name: &CStr) -> bool {
+    matches!(name.to_bytes(), b"." | b"..")
+}
+
+/// Flags for opening a cgroup directory only to `readdir`/`openat` under it:
+/// read-only, must be a directory, never traverse a symlink (kernfs has none, but
+/// this keeps the walk pinned to the one mount), and close-on-exec.
+const DIR_OFLAGS: OFlag = OFlag::O_RDONLY
+    .union(OFlag::O_DIRECTORY)
+    .union(OFlag::O_NOFOLLOW)
+    .union(OFlag::O_CLOEXEC);
 
 #[cfg(test)]
 mod tests {
