@@ -20,7 +20,7 @@
 // `RINGBUF_SIZE` in src/numa.rs: the inner-map prototype below is created at
 // this size and the kernel's map-in-map compatibility check requires every
 // inserted ring to match the prototype's metadata exactly.
-#define NUMA_RINGBUF_SIZE (1 << 16) // 64 KiB
+#define NUMA_RINGBUF_SIZE (1 << 18) // 256KiB
 
 // Ceiling on the NUMA node id used as the ARRAY_OF_MAPS key. Real hardware has
 // far fewer nodes; userspace only populates the slots for online nodes. An out
