@@ -16,13 +16,18 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
+struct IOStarts {
+    u64 read;
+    u64 write;
+};
+
 // Per-task start timestamp of the in-flight read/write, stashed at entry and
 // consumed at exit to compute the operation's duration.
 struct {
     __uint(type, BPF_MAP_TYPE_TASK_STORAGE);
     __uint(map_flags, BPF_F_NO_PREALLOC);
     __type(key, u32);
-    __type(value, u64);
+    __type(value, struct IOStarts);
 } TASK_STORAGE SEC(".maps");
 
 // Completed IO operations (struct IOEvent), drained by userspace IO metrics.
@@ -40,7 +45,8 @@ static __always_inline s32 file_to_mount_id(const struct file *file) {
     return BPF_CORE_READ(mnt, mnt_id);
 }
 
-static __always_inline void record_start(const struct file *file) {
+static __always_inline void record_start(const struct file *file,
+                                         bool is_write) {
     const enum FsMagic magic = file_fs_magic(file);
     // Skip ephemeral filesystems
     if (is_ephemeral_fs_cheap(magic)) {
@@ -48,12 +54,16 @@ static __always_inline void record_start(const struct file *file) {
     }
 
     struct task_struct *task = bpf_get_current_task_btf();
-    u64 *start_time = bpf_task_storage_get(&TASK_STORAGE, task, NULL,
-                                           BPF_LOCAL_STORAGE_GET_F_CREATE);
-    if (start_time == NULL) {
+    struct IOStarts *start_times = bpf_task_storage_get(
+        &TASK_STORAGE, task, NULL, BPF_LOCAL_STORAGE_GET_F_CREATE);
+    if (start_times == NULL) {
         return;
     }
-    *start_time = bpf_ktime_get_ns();
+    u64 *start_time = is_write ? &start_times->write : &start_times->read;
+    // set-if-zero: under same-op re-entrancy the outermost call wins.
+    if (*start_time == 0) {
+        *start_time = bpf_ktime_get_ns();
+    }
 }
 
 static __always_inline void record_end(const struct file *file, const s64 bytes,
@@ -70,6 +80,26 @@ static __always_inline void record_end(const struct file *file, const s64 bytes,
         return;
     }
 
+    struct task_struct *task = bpf_get_current_task_btf();
+    struct IOStarts *start_times =
+        bpf_task_storage_get(&TASK_STORAGE, task, NULL, 0);
+
+    u64 start_time_ns = 0;
+    if (start_times != NULL) {
+        if (is_write) {
+            start_time_ns = start_times->write;
+            start_times->write = 0;
+        } else {
+            start_time_ns = start_times->read;
+            start_times->read = 0;
+        }
+    }
+    // No matching start: entry was filtered (ephemeral fs) or already consumed
+    // by an inner re-entry. Either way, don't emit a bogus duration.
+    if (start_time_ns == 0) {
+        return;
+    }
+
     struct IOEvent *const event =
         numa_ringbuf_reserve(&IO_EVENTS, sizeof(struct IOEvent));
     if (event == NULL) {
@@ -77,15 +107,6 @@ static __always_inline void record_end(const struct file *file, const s64 bytes,
     }
 
     const u64 pid_tgid = bpf_get_current_pid_tgid();
-
-    struct task_struct *task = bpf_get_current_task_btf();
-    u64 *start_time = bpf_task_storage_get(&TASK_STORAGE, task, NULL, 0);
-
-    u64 start_time_ns = 0;
-    if (start_time != NULL) {
-        start_time_ns = *start_time;
-        *start_time = 0;
-    }
 
     const u32 MSB = 0b10000000000000000000000000000000;
     u32 num_bytes_transferred = (u32)bytes;
@@ -114,14 +135,14 @@ static __always_inline void record_end(const struct file *file, const s64 bytes,
 SEC("fentry/vfs_read")
 int BPF_PROG(record_vfs_read_entry, const struct file *file, char * /*buf*/,
              const u64 /*count*/, loff_t * /*pos*/) {
-    record_start(file);
+    record_start(file, false);
     return 0;
 }
 
 SEC("fentry/vfs_write")
 int BPF_PROG(record_vfs_write_entry, const struct file *file, char * /*buf*/,
              const u64 /*count*/, loff_t * /*pos*/) {
-    record_start(file);
+    record_start(file, true);
     return 0;
 }
 
