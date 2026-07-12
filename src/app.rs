@@ -211,9 +211,10 @@ async fn run_async(args: Args) -> Result<()> {
     ));
 
     // The single shared metric-event channel: every metric collector's decode
-    // callback sends its tagged event here, and one record task (spawned below)
-    // drains it.
-    let (tx, rx) = tokio::sync::mpsc::channel::<metrics::MetricEvent>(CHANNEL_CAPACITY);
+    // callback sends its tagged event here, and one record thread (spawned below)
+    // drains it. Array-backed (crossbeam) so its buffer is allocated once up front
+    // and send/recv never touch the allocator on the hot path.
+    let (tx, rx) = crossbeam_channel::bounded::<metrics::MetricEvent>(CHANNEL_CAPACITY);
     let mut recorders = Recorders::default();
 
     // Build one collector per enabled signal. Each opens + loads its own BPF
@@ -244,10 +245,13 @@ async fn run_async(args: Args) -> Result<()> {
         return Ok(());
     }
 
-    // The single record task draining the shared channel: dispatches each event
-    // to the matching signal's recorder. Spawned before attach so it is ready to
-    // consume the very first event.
-    let record_task = tokio::spawn(recorders.run(rx));
+    // The single record thread draining the shared channel: dispatches each event
+    // to the matching signal's recorder. A dedicated blocking thread (not a tokio
+    // task) so its crossbeam `recv` can park without tying up a runtime worker.
+    // Spawned before attach so it is ready to consume the very first event.
+    let record_thread = std::thread::Builder::new()
+        .name("event_recorder".into())
+        .spawn(move || recorders.run(rx))?;
 
     // Start the per-NUMA-node draining threads, then attach: every ring is
     // populated before any program can produce an event.
@@ -299,18 +303,20 @@ async fn run_async(args: Args) -> Result<()> {
     let _ = signal::ctrl_c().await;
     info!("Ctrl-C received, exiting...");
 
-    // Stop the shared timers, the shared record task, and every collector's own
-    // tasks before the skeletons drop; the tasks hold only Arcs and fd-dup'd
-    // MapHandles (independent of the skels), so aborting is clean.
+    // Stop the shared timers and every collector's own tasks before the skeletons
+    // drop; the tasks hold only Arcs and fd-dup'd MapHandles (independent of the
+    // skels), so aborting is clean.
     metrics_task.abort();
     cleanup_task.abort();
-    record_task.abort();
     for collector in collectors.iter() {
         collector.shutdown();
     }
     // Stop and join the per-NUMA-node draining threads before the collectors
-    // (and their ring buffer maps) drop.
+    // (and their ring buffer maps) drop. Joining them drops the last channel
+    // senders, which closes the queue so the record thread's `recv` returns and
+    // it drains any tail before we join it.
     drainers.shutdown();
+    let _ = record_thread.join();
 
     Ok(())
 }

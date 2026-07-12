@@ -150,7 +150,7 @@ impl IoMetrics {
     /// Record an IO event, lazily attaching IO instruments to the cgroup's shared
     /// meter on first sight. Events in unresolvable or root cgroups (no meter) are
     /// dropped.
-    pub async fn record(&self, event: &bindings::IOEvent) {
+    pub fn record(&self, event: &bindings::IOEvent) {
         if event.fs_magic.is_ephemeral_fs() {
             return;
         }
@@ -175,9 +175,7 @@ impl IoMetrics {
                     duration_histogram,
                     size_histogram,
                 }
-            })
-            .await
-        {
+            }) {
             Some(m) => m,
             None => return,
         };
