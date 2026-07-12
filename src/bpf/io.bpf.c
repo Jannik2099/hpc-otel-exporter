@@ -70,20 +70,15 @@ static __always_inline void record_end(const struct file *file, const s64 bytes,
                                        const bool is_write) {
     const u64 end_time = bpf_ktime_get_ns();
 
-    if (bytes <= 0) {
-        // No bytes transferred, skip
-        return;
-    }
-
-    const enum FsMagic magic = file_fs_magic(file);
-    if (is_ephemeral_fs_cheap(magic)) {
-        return;
-    }
-
     struct task_struct *task = bpf_get_current_task_btf();
     struct IOStarts *start_times =
         bpf_task_storage_get(&TASK_STORAGE, task, NULL, 0);
 
+    // Always consume + clear the slot, even if we drop this event below, so a
+    // filtered exit (bytes <= 0, ephemeral fs) can't orphan the timestamp. The
+    // set-if-zero in record_start would otherwise refuse to refresh the stale
+    // value, making the next successful op compute a bogus duration from an
+    // ancient start time.
     u64 start_time_ns = 0;
     if (start_times != NULL) {
         if (is_write) {
@@ -97,6 +92,16 @@ static __always_inline void record_end(const struct file *file, const s64 bytes,
     // No matching start: entry was filtered (ephemeral fs) or already consumed
     // by an inner re-entry. Either way, don't emit a bogus duration.
     if (start_time_ns == 0) {
+        return;
+    }
+
+    if (bytes <= 0) {
+        // No bytes transferred, skip
+        return;
+    }
+
+    const enum FsMagic magic = file_fs_magic(file);
+    if (is_ephemeral_fs_cheap(magic)) {
         return;
     }
 
