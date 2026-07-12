@@ -210,17 +210,8 @@ impl MetadataCollector {
         ctx.drainer.register(
             "vfs_metadata_events_node",
             &skel.maps.VFS_METADATA_EVENTS,
-            {
-                let events = ctx.events.clone();
-                let dropped = Arc::clone(&dropped);
-                Arc::new(move |data| {
-                    if let Some(event) = decode_event::<MetadataEvent>(data)
-                        && events.try_send(MetricEvent::Metadata(event)).is_err()
-                    {
-                        dropped.fetch_add(1, Ordering::Relaxed);
-                    }
-                })
-            },
+            Arc::new(|data| decode_event::<MetadataEvent>(data).map(MetricEvent::Metadata)),
+            Arc::clone(&dropped),
         )?;
 
         let metrics = Arc::new(MetadataMetrics::new(Arc::clone(&ctx.registry)));

@@ -221,14 +221,13 @@ async fn run_async(args: Args) -> Result<()> {
     // registers its per-NUMA-node rings with the shared drainer, and (for metric
     // signals) registers its recording state on `recorders`. Nothing is attached
     // yet.
-    let mut drainer = numa::DrainerBuilder::new();
+    let mut drainer = numa::DrainerBuilder::new(tx);
     let mut collectors: Vec<Box<dyn Collector>> = Vec::new();
     {
         let mut ctx = BuildCtx {
             registry: Arc::clone(&registry),
             v1_hierarchy_id,
             drainer: &mut drainer,
-            events: tx,
             recorders: &mut recorders,
         };
         for signal in &enabled {

@@ -25,9 +25,12 @@
 //!
 //! [`register`]: DrainerBuilder::register
 
+use std::cell::UnsafeCell;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
 use anyhow::Result;
@@ -35,7 +38,10 @@ use libbpf_rs::{MapCore, MapFlags, MapHandle, MapType, RingBuffer, RingBufferBui
 use log::{error, info, warn};
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+use crate::metrics::MetricEvent;
 
 /// Byte size of each per-node ring buffer. MUST stay in sync with
 /// `NUMA_RINGBUF_SIZE` in `src/bpf/numa_ringbuf.bpf.h`: the inner-map prototype
@@ -48,12 +54,17 @@ const RINGBUF_SIZE: u32 = 1 << 18; // 256KiB
 /// rings carry exactly this flag to match the prototype's `map_flags`.
 const BPF_F_NUMA_NODE: u32 = 1 << 2;
 
+/// Pre-reserved capacity for a draining thread's per-source batch buffer: an
+/// upper bound on the records one `consume_raw` can yield from a single ring.
+const BATCH_CAP: usize = RINGBUF_SIZE as usize / std::mem::size_of::<MetricEvent>();
+
 /// A feature's decode callback, run on the draining thread for every raw ring
-/// payload. Shared behind an `Arc` because the same callback drains every
-/// node's ring for that feature. Must stay cheap and non-blocking (decode +
-/// `try_send`); drop-on-full is the callback's business, matching the
-/// drop-on-full behaviour the kernel ring buffer already has.
-pub type RingCallback = Arc<dyn Fn(&[u8]) + Send + Sync>;
+/// payload: turn one raw ring record into a buffered item `T` (or `None` when
+/// the payload is too short). Shared behind an `Arc` because the same callback
+/// decodes every node's ring for that feature; must stay cheap and non-blocking.
+/// Draining collects the decoded items into a per-thread batch and flushes the
+/// batch onto the channel in one reserve, see [`DrainerBuilder`].
+pub type DecodeFn<T> = Arc<dyn Fn(&[u8]) -> Option<T> + Send + Sync>;
 
 /// Decode a POD event `T` from a raw ring payload, or `None` when the payload
 /// is too short. Reads unaligned: ring slices carry no alignment guarantee.
@@ -72,25 +83,123 @@ struct NumaNode {
     cpus: Vec<usize>,
 }
 
+/// One registered feature's per-node contribution to a draining thread: its ring
+/// for that node, its decode callback, and its drop counter.
+type NodeSource<T> = (MapHandle, DecodeFn<T>, Arc<AtomicU64>);
+
 /// One registered feature: its per-node rings (index-aligned with the builder's
-/// node list) and the callback that decodes its payloads.
-struct Source {
+/// node list), the callback that decodes its payloads, and the counter it bumps
+/// when the channel is full and events are dropped.
+struct Source<T> {
     rings: Vec<MapHandle>,
-    cb: RingCallback,
+    decode: DecodeFn<T>,
+    dropped: Arc<AtomicU64>,
+}
+
+/// A drain thread's per-source batch buffer, shared (via `Rc`) between the ring
+/// callback that fills it during `consume_raw` and the [`Flusher`] that empties
+/// it right after.
+///
+/// Uses `UnsafeCell` rather than `RefCell` to skip a borrow-flag check on the
+/// per-event hot path: the two accessors run on the same thread and never
+/// overlap. During `consume_raw` libbpf invokes the callback one record at a
+/// time, each [`push`](Self::push) taking and releasing a transient `&mut`
+/// before the next; the flush's [`get`](Self::get) runs only *after*
+/// `consume_raw` has returned, when no callback borrow is live. So no two `&mut`
+/// to the buffer ever coexist. `Rc` (not `Arc`) keeps it `!Send`, pinning it to
+/// its drain thread.
+struct Batch<T>(UnsafeCell<Vec<T>>);
+
+impl<T> Batch<T> {
+    fn with_capacity(cap: usize) -> Self {
+        Self(UnsafeCell::new(Vec::with_capacity(cap)))
+    }
+
+    /// Append one decoded item. Called only from the ring callback.
+    ///
+    /// # Safety
+    /// No other borrow of the buffer may be live. Upheld because callbacks run
+    /// sequentially inside `consume_raw` and never concurrently with [`get`].
+    ///
+    /// [`get`]: Self::get
+    unsafe fn push(&self, item: T) {
+        // Safety: exclusive, non-overlapping access per the type's invariant.
+        unsafe { (*self.0.get()).push(item) };
+    }
+
+    /// Exclusive access to the buffer for flushing. Called only after
+    /// `consume_raw` returns, when no callback borrow is live.
+    ///
+    /// # Safety
+    /// As [`push`](Self::push): no other borrow may be live.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn get(&self) -> &mut Vec<T> {
+        // Safety: exclusive, non-overlapping access per the type's invariant.
+        unsafe { &mut *self.0.get() }
+    }
+}
+
+/// One feature's per-thread draining state: the batch buffer its ring callback
+/// pushes decoded items into during `consume_raw`, and the drop counter its
+/// [`flush`](Self::flush) bumps for events the channel had no room for.
+struct Flusher<T> {
+    buffer: Rc<Batch<T>>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl<T> Flusher<T> {
+    /// Push the whole batch onto `sender` in one reserve, then clear it. On the
+    /// common path a single `try_reserve_many` acquires a permit for every
+    /// buffered item at once (one semaphore op for the batch instead of one per
+    /// event); when the channel is full it takes only what currently fits and
+    /// drops the tail, matching the ring buffer's own drop-on-full behaviour.
+    fn flush(&self, sender: &mpsc::Sender<T>) {
+        // Safety: `consume_raw` has returned, so no ring callback (the only other
+        // accessor) is running. This is the buffer's sole live borrow.
+        let buf = unsafe { self.buffer.get() };
+        let n = buf.len();
+        if n == 0 {
+            return;
+        }
+        let permits = sender
+            .try_reserve_many(n)
+            // Channel full: reserve only what fits right now, drop the rest.
+            .or_else(|_| sender.try_reserve_many(n.min(sender.capacity())));
+        if let Ok(permits) = permits {
+            // `permits` holds exactly as many slots as were reserved; drain that
+            // many so the unsent tail stays in `buf` to be counted below (draining
+            // more than we send would silently discard events uncounted).
+            let take = permits.len();
+            for (permit, item) in permits.zip(buf.drain(..take)) {
+                permit.send(item);
+            }
+        }
+        // Whatever's left (all of it if both reserves failed) had no room in the
+        // channel: count it as dropped and clear so the next batch starts empty.
+        let dropped = buf.len();
+        if dropped > 0 {
+            self.dropped.fetch_add(dropped as u64, Ordering::Relaxed);
+            buf.clear();
+        }
+    }
 }
 
 /// Builder collecting every feature's per-node rings before the draining
 /// threads start. Features [`register`](Self::register) while wiring up (after
 /// their maps are loaded, before their programs attach); [`start`](Self::start)
-/// then spawns one pinned draining thread per node covering all of them.
-pub struct DrainerBuilder {
+/// then spawns one pinned draining thread per node covering all of them. Owns
+/// the `sender` half of the single shared channel; each draining thread batches
+/// decoded events and flushes them down it (see [`Flusher`]).
+pub struct DrainerBuilder<T> {
     nodes: Vec<NumaNode>,
-    sources: Vec<Source>,
+    sources: Vec<Source<T>>,
+    sender: mpsc::Sender<T>,
 }
 
-impl DrainerBuilder {
-    /// Enumerate the machine's NUMA topology; no rings exist yet.
-    pub fn new() -> Self {
+impl<T: Send + 'static> DrainerBuilder<T> {
+    /// Enumerate the machine's NUMA topology; no rings exist yet. `sender` is the
+    /// channel every draining thread's batch is flushed onto.
+    pub fn new(sender: mpsc::Sender<T>) -> Self {
         let nodes = numa_nodes();
         info!(
             "draining {} NUMA node ring buffer(s) ({} total)",
@@ -100,17 +209,25 @@ impl DrainerBuilder {
         Self {
             nodes,
             sources: Vec::new(),
+            sender,
         }
     }
 
     /// Create one NUMA-placed ring buffer per online node for a feature, insert
-    /// each into the feature's outer `ARRAY_OF_MAPS`, and record `cb` as the
-    /// decode callback for those rings. `name` names the inner rings (visible in
-    /// `bpftool map list`).
+    /// each into the feature's outer `ARRAY_OF_MAPS`, and record `decode` as the
+    /// callback turning those rings' records into buffered items. `dropped` is
+    /// the counter bumped for events the channel had no room for. `name` names
+    /// the inner rings (visible in `bpftool map list`).
     ///
     /// Must be called **before** the feature's eBPF programs are attached, so
     /// events always find a populated ring for their node.
-    pub fn register(&mut self, name: &str, outer: &impl MapCore, cb: RingCallback) -> Result<()> {
+    pub fn register(
+        &mut self,
+        name: &str,
+        outer: &impl MapCore,
+        decode: DecodeFn<T>,
+        dropped: Arc<AtomicU64>,
+    ) -> Result<()> {
         let mut rings = Vec::with_capacity(self.nodes.len());
         for node in &self.nodes {
             // The rings' pages are placed on the node so its CPUs reserve locally.
@@ -118,7 +235,11 @@ impl DrainerBuilder {
             insert_ring(outer, node.id, &ring)?;
             rings.push(ring);
         }
-        self.sources.push(Source { rings, cb });
+        self.sources.push(Source {
+            rings,
+            decode,
+            dropped,
+        });
         Ok(())
     }
 
@@ -130,11 +251,14 @@ impl DrainerBuilder {
         let mut threads = Vec::with_capacity(self.nodes.len());
 
         // Regroup the per-source ring columns into one row per node.
-        let mut per_node: Vec<Vec<(MapHandle, RingCallback)>> =
-            self.nodes.iter().map(|_| Vec::new()).collect();
+        let mut per_node: Vec<Vec<NodeSource<T>>> = self.nodes.iter().map(|_| Vec::new()).collect();
         for source in self.sources {
             for (slot, ring) in per_node.iter_mut().zip(source.rings) {
-                slot.push((ring, Arc::clone(&source.cb)));
+                slot.push((
+                    ring,
+                    Arc::clone(&source.decode),
+                    Arc::clone(&source.dropped),
+                ));
             }
         }
 
@@ -143,10 +267,11 @@ impl DrainerBuilder {
                 continue;
             }
             let stop = stop.clone();
+            let sender = self.sender.clone();
             let id = node.id;
             let thread = std::thread::Builder::new()
                 .name(format!("drain-node{id}"))
-                .spawn(move || drain_node(id, &node.cpus, rings, &stop))?;
+                .spawn(move || drain_node(id, &node.cpus, rings, sender, &stop))?;
             threads.push(thread);
         }
 
@@ -205,27 +330,43 @@ fn insert_ring(outer: &impl MapCore, node: u32, ring: &MapHandle) -> Result<()> 
 }
 
 /// Body of a per-node draining thread: pin to the node's CPUs, then poll the
-/// node's rings, running each feature's decode callback, until signalled to
-/// stop. Owns the ring handles for its lifetime (the kernel keeps the rings
-/// alive via the outer arrays regardless).
-fn drain_node(
+/// node's rings, decoding each feature's records into a per-source batch buffer
+/// and flushing the batches down `sender`, until signalled to stop. Owns the
+/// ring handles for its lifetime (the kernel keeps the rings alive via the outer
+/// arrays regardless).
+fn drain_node<T: 'static>(
     id: u32,
     cpus: &[usize],
-    rings: Vec<(MapHandle, RingCallback)>,
+    rings: Vec<NodeSource<T>>,
+    sender: mpsc::Sender<T>,
     stop: &CancellationToken,
 ) {
     pin_to_cpus(id, cpus);
 
+    // One batch buffer per source, shared (single-threaded `Rc`) between the ring
+    // callback that fills it during `consume_raw` and the flush that empties it
+    // right after. Pre-sized so a full ring's worth of events never reallocates.
     let mut builder = RingBufferBuilder::new();
-    for (ring, cb) in &rings {
-        let cb = Arc::clone(cb);
+    let mut flushers = Vec::with_capacity(rings.len());
+    for (ring, decode, dropped) in &rings {
+        let buffer = Rc::new(Batch::with_capacity(BATCH_CAP));
+        let decode = Arc::clone(decode);
+        let cb_buffer = Rc::clone(&buffer);
         if let Err(e) = builder.add(ring, move |data: &[u8]| {
-            cb(data);
+            if let Some(item) = decode(data) {
+                // Safety: called only here, sequentially within `consume_raw`,
+                // never overlapping this buffer's flush (which runs after).
+                unsafe { cb_buffer.push(item) };
+            }
             0
         }) {
             error!("node {id}: failed to register ring buffer: {e}");
             return;
         }
+        flushers.push(Flusher {
+            buffer,
+            dropped: Arc::clone(dropped),
+        });
     }
     let ring_buffer = match builder.build() {
         Ok(rb) => rb,
@@ -245,15 +386,21 @@ fn drain_node(
             return;
         }
     };
-    runtime.block_on(drain_loop(id, &ring_buffer, stop));
+    runtime.block_on(drain_loop(id, &ring_buffer, &sender, &flushers, stop));
 }
 
 /// Drain `ring_buffer` on the current-thread runtime: sleep in epoll on the
 /// ring's fd, and greedily `consume` whenever it becomes readable, until `stop`
 /// is cancelled. `consume` drains every pending event (the fd is edge-triggered,
-/// so a partial drain would leave events unwoken), then `clear_ready` re-arms
-/// the wait for the next batch.
-async fn drain_loop(id: u32, ring_buffer: &RingBuffer<'_>, stop: &CancellationToken) {
+/// so a partial drain would leave events unwoken) into the sources' batch
+/// buffers, which are then flushed down `sender` in one reserve each.
+async fn drain_loop<T>(
+    id: u32,
+    ring_buffer: &RingBuffer<'_>,
+    sender: &mpsc::Sender<T>,
+    flushers: &[Flusher<T>],
+    stop: &CancellationToken,
+) {
     let epoll_fd = ring_buffer.epoll_fd();
     let async_fd = match AsyncFd::with_interest(
         unsafe { BorrowedFd::borrow_raw(epoll_fd) },
@@ -271,6 +418,13 @@ async fn drain_loop(id: u32, ring_buffer: &RingBuffer<'_>, stop: &CancellationTo
             _ = stop.cancelled() => break,
             _ = async_fd.async_io(Interest::READABLE, |_| {
                 let consumed = ring_buffer.consume_raw();
+                // `consume_raw` has returned, so every ring callback has finished
+                // and released its buffer borrow: safe to flush the batches now.
+                if consumed > 0 {
+                    for flusher in flushers {
+                        flusher.flush(sender);
+                    }
+                }
                 match consumed {
                     n if n > 0 => Ok(n),
                     0 => Err(std::io::ErrorKind::WouldBlock.into()),

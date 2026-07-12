@@ -265,18 +265,12 @@ impl IoCollector {
         let skel = open_skel.load()?;
 
         let dropped = Arc::new(AtomicU64::new(0));
-        ctx.drainer
-            .register("io_events_node", &skel.maps.IO_EVENTS, {
-                let events = ctx.events.clone();
-                let dropped = Arc::clone(&dropped);
-                Arc::new(move |data| {
-                    if let Some(event) = decode_event::<IOEvent>(data)
-                        && events.try_send(MetricEvent::Io(event)).is_err()
-                    {
-                        dropped.fetch_add(1, Ordering::Relaxed);
-                    }
-                })
-            })?;
+        ctx.drainer.register(
+            "io_events_node",
+            &skel.maps.IO_EVENTS,
+            Arc::new(|data| decode_event::<IOEvent>(data).map(MetricEvent::Io)),
+            Arc::clone(&dropped),
+        )?;
 
         let metrics = Arc::new(IoMetrics::new(Arc::clone(&ctx.registry)));
         ctx.recorders.io = Some(Arc::clone(&metrics));

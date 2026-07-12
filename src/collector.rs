@@ -10,10 +10,10 @@
 //!
 //! Construction happens through a [`BuildCtx`]: the collector opens its
 //! skeleton (stamping the shared cgroup-mode rodata knobs, see
-//! [`configure_cgroup_rodata`]), loads it, registers its per-NUMA-node rings
-//! with the shared [`DrainerBuilder`], and — for metric signals — registers its
-//! recording state with the shared [`Recorders`] and sends decoded events down
-//! the single shared channel (`ctx.events`).
+//! [`configure_cgroup_rodata`]), loads it, registers its per-NUMA-node rings +
+//! decode callback with the shared [`DrainerBuilder`] (which owns the channel
+//! sender and batches decoded events onto it), and, for metric signals,
+//! registers its recording state with the shared [`Recorders`].
 //! The app then starts the draining threads and calls [`Collector::attach`] on
 //! everyone — rings are always populated before any program can produce an
 //! event.
@@ -23,8 +23,6 @@ use rustc_hash::FxHashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-
-use tokio::sync::mpsc;
 
 use crate::cgroup::CgroupRegistry;
 use crate::metrics::{MetricEvent, Recorders};
@@ -48,12 +46,10 @@ pub struct BuildCtx<'a> {
     /// skeleton's rodata knobs (see `src/bpf/cgroup_id.bpf.h`).
     pub v1_hierarchy_id: Option<i32>,
     /// The shared per-NUMA-node drainer; collectors register their outer
-    /// `ARRAY_OF_MAPS` + decode callback here (before any program attaches).
-    pub drainer: &'a mut DrainerBuilder,
-    /// Sender for the single shared metric-event channel. A metric collector's
-    /// decode callback captures a clone and `try_send`s its tagged
-    /// [`MetricEvent`]; non-metric collectors ignore it.
-    pub events: mpsc::Sender<MetricEvent>,
+    /// `ARRAY_OF_MAPS` + decode callback here (before any program attaches). It
+    /// owns the metric-event channel sender and batches each drained ring's
+    /// decoded [`MetricEvent`]s onto it.
+    pub drainer: &'a mut DrainerBuilder<MetricEvent>,
     /// The shared record-side state. A metric collector stores its `*Metrics`
     /// here so the single record task can dispatch that signal's events.
     pub recorders: &'a mut Recorders,
