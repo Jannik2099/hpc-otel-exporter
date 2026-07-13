@@ -284,6 +284,14 @@ async fn run_async(args: Args) -> Result<()> {
     }
     info!("eBPF programs attached!");
 
+    // Profiling needs to read /proc/pid/maps
+    // TODO: externalize to a separate process?
+    if enabled.contains(&Signal::CpuProfiles) {
+        crate::sandbox::init_sandbox(false)?;
+    } else {
+        crate::sandbox::init_sandbox(true)?;
+    }
+
     // Shared with the cleanup task below; shutdown still walks them at the end.
     let collectors: Arc<[Box<dyn Collector>]> = Arc::from(collectors);
 

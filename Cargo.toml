@@ -65,6 +65,7 @@ nix = { version = "0.31.3", features = [
     "user",
     "fs",
 ], default-features = false }
+landlock = "0.4.5"
 
 [patch.crates-io]
 gimli = { git = "https://github.com/Jannik2099/gimli.git", rev = "b6a29d5900886ac11a63686e5af5d1031406225b" }
