@@ -16,6 +16,7 @@ mod collector;
 mod metrics;
 mod numa;
 mod profiling;
+mod sandbox;
 #[cfg(feature = "pyroscope")]
 mod self_profile;
 mod telemetry;
