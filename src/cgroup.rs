@@ -65,7 +65,7 @@ const SLOW_EXPORT_THRESHOLD: Duration = Duration::from_secs(2);
 pub type CgroupView = Arc<dyn Fn(&Instrument) -> Option<Stream> + Send + Sync>;
 
 /// Which cgroup hierarchy the exporter tracks, selected at startup by
-/// `--use-cgroups-v1` and kept in lockstep with the eBPF side (see
+/// `--cgroups-mode` and kept in lockstep with the eBPF side (see
 /// `src/bpf/cgroup_id.bpf.h`): the BPF programs stamp events with the matching
 /// id, and the registry resolves/walks the matching mount.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

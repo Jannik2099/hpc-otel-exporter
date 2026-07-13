@@ -106,9 +106,10 @@ pub struct Args {
     #[arg(long)]
     num_threads: Option<usize>,
 
-    /// Group events by cgroup v1 `cpu,cpuacct` hierarchy instead of v2 (unified)
-    #[arg(long)]
-    use_cgroups_v1: bool,
+    /// Which cgroup hierarchy to group events by: `v1` (cpu,cpuacct), `v2`
+    /// (unified), or `auto` — v1 if the cpu,cpuacct v1 controller exists, else v2.
+    #[arg(long, value_enum, default_value_t = CgroupsMode::Auto)]
+    cgroups_mode: CgroupsMode,
 
     /// Comma-separated cgroup coalescing filters, applied in order.
     /// Known: `slurm`, `user-session`.
@@ -120,6 +121,16 @@ pub struct Args {
     /// filter-claimed cgroups (a whitelist). With no filters this drops everything.
     #[arg(long)]
     drop_unhandled: bool,
+}
+
+/// Which cgroup hierarchy to track, selected via `--cgroups-mode`. `Auto` (the
+/// default) resolves to v1 when the `cpu,cpuacct` v1 controller is present and
+/// v2 otherwise; `V1`/`V2` force the choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum CgroupsMode {
+    V1,
+    V2,
+    Auto,
 }
 
 /// Detect the cgroup v1 `cpu,cpuacct` hierarchy id from `/proc/self/cgroup` (the
@@ -184,14 +195,26 @@ async fn run_async(args: Args) -> Result<()> {
     // Select v1 vs v2 cgroup tracking before load: every signal object reads
     // the same rodata knobs (see src/bpf/cgroup_id.bpf.h) and the registry
     // resolves the matching hierarchy. For v1 we pass the cpu,cpuacct hierarchy
-    // id so bpf_task_get_cgroup1 fetches the right cgroup.
-    let (cgroup_mode, v1_hierarchy_id) = if args.use_cgroups_v1 {
-        let hierarchy_id = detect_cpu_v1_hierarchy_id()
-            .ok_or_else(|| anyhow::anyhow!("could not detect the cpu,cpuacct v1 hierarchy id"))?;
-        info!("tracking cgroup v1 (cpu,cpuacct hierarchy id {hierarchy_id})");
-        (CgroupMode::V1, Some(hierarchy_id))
-    } else {
-        (CgroupMode::V2, None)
+    // id so bpf_task_get_cgroup1 fetches the right cgroup. In `auto` mode the
+    // presence of that hierarchy (a `cpu` controller line in /proc/self/cgroup)
+    // is what selects v1.
+    let v1_hierarchy_id =
+        match args.cgroups_mode {
+            CgroupsMode::V1 => Some(detect_cpu_v1_hierarchy_id().ok_or_else(|| {
+                anyhow::anyhow!("could not detect the cpu,cpuacct v1 hierarchy id")
+            })?),
+            CgroupsMode::V2 => None,
+            CgroupsMode::Auto => detect_cpu_v1_hierarchy_id(),
+        };
+    let (cgroup_mode, v1_hierarchy_id) = match v1_hierarchy_id {
+        Some(hierarchy_id) => {
+            info!("tracking cgroups v1 (cpu,cpuacct hierarchy id {hierarchy_id})");
+            (CgroupMode::V1, Some(hierarchy_id))
+        }
+        None => {
+            info!("tracking cgroups v2 (unified hierarchy)");
+            (CgroupMode::V2, None)
+        }
     };
 
     // Install the global tracer provider (OTLP/gRPC), kept alive for the whole run
