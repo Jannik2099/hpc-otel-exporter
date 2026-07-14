@@ -1,7 +1,7 @@
 use anyhow::Result;
 use landlock::{
-    Access, AccessFs, AccessNet, CompatLevel, Compatible, RulesetAttr, RulesetCreatedAttr,
-    RulesetStatus, Scope,
+    AccessFs, AccessNet, CompatLevel, Compatible, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
+    Scope,
 };
 use log::info;
 use nix::unistd::{Gid, Uid, User, setgroups, setresgid, setresuid};
@@ -20,7 +20,7 @@ fn init_landlock() -> Result<()> {
     let status = ruleset
         .handle_access(AccessFs::from_write(abi))?
         .handle_access(AccessNet::BindTcp)?
-        .scope(Scope::from_all(abi))?
+        .scope(Scope::Signal)?
         .set_compatibility(CompatLevel::BestEffort)
         .create()?
         .no_new_privs(true)
