@@ -17,6 +17,8 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::{SdkLogger, SdkLoggerProvider};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_opentelemetry::OpenTelemetryLayer;
+use tracing_subscriber::Layer;
+use tracing_subscriber::filter::{EnvFilter, LevelFilter, filter_fn};
 use tracing_subscriber::layer::SubscriberExt;
 
 /// Best-effort system hostname, recorded as the `host.name` resource attribute on
@@ -121,40 +123,63 @@ pub(crate) fn record_span_error(span: &tracing::Span, err: &impl std::fmt::Displ
 pub fn init_tracing() -> Option<TracingGuard> {
     // Per the OTel SDK spec, `OTEL_TRACES_EXPORTER=none` disables trace export.
     // We only support the OTLP exporter, so treat every other value (including
-    // unset) as "install OTLP".
-    if let Ok(val) = std::env::var("OTEL_TRACES_EXPORTER")
-        && val.eq_ignore_ascii_case("none")
-    {
-        return None;
-    }
+    // unset) as "install OTLP". Even when export is disabled we still install the
+    // console `fmt` layer below, so the SDK's own diagnostics stay visible.
+    let traces_disabled =
+        std::env::var("OTEL_TRACES_EXPORTER").is_ok_and(|val| val.eq_ignore_ascii_case("none"));
 
-    let exporter = SpanExporter::builder()
-        .with_tonic()
-        .with_protocol(Protocol::Grpc)
-        .with_compression(Compression::Zstd)
-        .with_tls_config(otlp_tls_config())
-        .build()
-        .expect("failed to create OTLP span exporter");
+    let (otel_layer, guard) = if traces_disabled {
+        (None, None)
+    } else {
+        let exporter = SpanExporter::builder()
+            .with_tonic()
+            .with_protocol(Protocol::Grpc)
+            .with_compression(Compression::Zstd)
+            .with_tls_config(otlp_tls_config())
+            .build()
+            .expect("failed to create OTLP span exporter");
 
-    let provider = SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
-        .with_resource(build_resource())
-        .build();
+        let provider = SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
+            .with_resource(build_resource())
+            .build();
 
-    opentelemetry::global::set_tracer_provider(provider.clone());
+        opentelemetry::global::set_tracer_provider(provider.clone());
 
-    let otel_layer = OpenTelemetryLayer::new(provider.tracer("hpc-otel-exporter"));
+        // Keep the SDK's own internal `tracing` events out of the OTLP trace layer:
+        // exporting telemetry-about-telemetry risks a feedback loop. They still
+        // reach the console `fmt` layer below.
+        let layer = OpenTelemetryLayer::new(provider.tracer("hpc-otel-exporter")).with_filter(
+            filter_fn(|meta| !meta.target().starts_with("opentelemetry")),
+        );
+        (Some(layer), Some(TracingGuard(provider)))
+    };
 
-    let subscriber = tracing_subscriber::registry().with(otel_layer);
+    // Console sink for `tracing` events, honouring `RUST_LOG`. The OTel SDK emits
+    // its internal diagnostics (exporter transport errors, retries, dropped
+    // batches) through `tracing`, *not* `log`, so without this layer they never
+    // reach the console however `RUST_LOG` is set. Defaults to INFO when `RUST_LOG`
+    // is unset; scope the noise with e.g. `RUST_LOG=opentelemetry=debug`.
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env_lossy(),
+        );
+
+    let subscriber = tracing_subscriber::registry()
+        .with(otel_layer)
+        .with(fmt_layer);
     // Set the subscriber directly rather than via `.init()`: the latter also
     // installs a `tracing-log` `LogTracer` as the global `log` logger, which
     // collides with the `DualLogger` already installed by `init_logging` and
     // panics with `SetLoggerError`. We keep `log` records (-> DualLogger ->
-    // console + OTLP logs) and `tracing` spans (-> OTLP traces) on separate
-    // pipelines on purpose.
+    // console + OTLP logs) and `tracing` events (-> console + OTLP traces) on
+    // separate pipelines on purpose.
     tracing::subscriber::set_global_default(subscriber)
         .expect("failed to set global default tracing subscriber");
-    Some(TracingGuard(provider))
+    guard
 }
 
 /// Flushes and shuts the global tracer provider down when dropped.
