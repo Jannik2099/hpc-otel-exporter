@@ -200,34 +200,46 @@ impl Drop for TracingGuard {
 /// (set in [`init_logging`]) gates what reaches either sink.
 struct DualLogger {
     console: env_logger::Logger,
-    otel: OpenTelemetryLogBridge<SdkLoggerProvider, SdkLogger>,
+    /// OTLP log bridge, or `None` when `OTEL_LOGS_EXPORTER=none` disables export.
+    otel: Option<OpenTelemetryLogBridge<SdkLoggerProvider, SdkLogger>>,
 }
 
 impl log::Log for DualLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        self.console.enabled(metadata) || self.otel.enabled(metadata)
+        self.console.enabled(metadata)
+            || self
+                .otel
+                .as_ref()
+                .is_some_and(|otel| otel.enabled(metadata))
     }
 
     fn log(&self, record: &log::Record) {
         // `env_logger` applies its own `RUST_LOG` filtering inside `log`; the
         // bridge exports whatever passed the global max level.
         self.console.log(record);
-        self.otel.log(record);
+        if let Some(otel) = &self.otel {
+            otel.log(record);
+        }
     }
 
     fn flush(&self) {
         self.console.flush();
-        self.otel.flush();
+        if let Some(otel) = &self.otel {
+            otel.flush();
+        }
     }
 }
 
 /// Flushes and shuts the OpenTelemetry logger provider down when dropped, so
-/// buffered log records are exported on a clean exit.
-pub struct LoggingGuard(SdkLoggerProvider);
+/// buffered log records are exported on a clean exit. Holds `None` when OTLP log
+/// export is disabled via `OTEL_LOGS_EXPORTER=none`.
+pub struct LoggingGuard(Option<SdkLoggerProvider>);
 
 impl Drop for LoggingGuard {
     fn drop(&mut self) {
-        if let Err(e) = self.0.shutdown() {
+        if let Some(provider) = &self.0
+            && let Err(e) = provider.shutdown()
+        {
             // The `log` logger is being torn down, so report directly.
             eprintln!("failed to shut down logger provider: {e}");
         }
@@ -241,21 +253,36 @@ impl Drop for LoggingGuard {
 ///
 /// Call once, before any other telemetry, so even setup-time logs are exported.
 ///
+/// Honours the standardized `OTEL_LOGS_EXPORTER` env var: when it is set to
+/// `none`, no logger provider or OTLP exporter is installed and only the console
+/// sink remains, so OTLP log export is entirely opt-out. This matters when the
+/// collector has no logs pipeline: otherwise the batch processor keeps trying to
+/// export and the collector answers with gRPC `Unimplemented`. Any other value
+/// (or unset) installs the OTLP exporter as usual.
+///
 /// [appender bridge]: opentelemetry_appender_log::OpenTelemetryLogBridge
 #[must_use = "log records stop being exported once the guard is dropped"]
 pub fn init_logging(env: env_logger::Env<'_>) -> LoggingGuard {
-    let exporter = LogExporter::builder()
-        .with_tonic()
-        .with_protocol(Protocol::Grpc)
-        .with_compression(Compression::Zstd)
-        .with_tls_config(otlp_tls_config())
-        .build()
-        .expect("failed to create OTLP log exporter");
+    // Per the OTel SDK spec, `OTEL_LOGS_EXPORTER=none` disables log export. We
+    // only support the OTLP exporter, so treat every other value (including
+    // unset) as "install OTLP".
+    let logs_disabled =
+        std::env::var("OTEL_LOGS_EXPORTER").is_ok_and(|val| val.eq_ignore_ascii_case("none"));
 
-    let provider = SdkLoggerProvider::builder()
-        .with_batch_exporter(exporter)
-        .with_resource(build_resource())
-        .build();
+    let provider = (!logs_disabled).then(|| {
+        let exporter = LogExporter::builder()
+            .with_tonic()
+            .with_protocol(Protocol::Grpc)
+            .with_compression(Compression::Zstd)
+            .with_tls_config(otlp_tls_config())
+            .build()
+            .expect("failed to create OTLP log exporter");
+
+        SdkLoggerProvider::builder()
+            .with_batch_exporter(exporter)
+            .with_resource(build_resource())
+            .build()
+    });
 
     let console = env_logger::Builder::from_env(env).build();
     // Gate both sinks at the most verbose level env_logger is configured for.
@@ -263,7 +290,7 @@ pub fn init_logging(env: env_logger::Env<'_>) -> LoggingGuard {
 
     let logger = DualLogger {
         console,
-        otel: OpenTelemetryLogBridge::new(&provider),
+        otel: provider.as_ref().map(OpenTelemetryLogBridge::new),
     };
     log::set_boxed_logger(Box::new(logger)).expect("global logger already set");
     log::set_max_level(max_level);
