@@ -19,8 +19,12 @@
 //! canonical inode and relies on it appearing in the liveness walk. Kept separate
 //! from the short human [`name`](Filtered::Coalesce::name) used for labels.
 
+use std::num::NonZeroUsize;
 use std::path::Path;
+use std::process::Command;
+use std::sync::Mutex;
 
+use lru::LruCache;
 use nix::unistd::{Uid, User};
 use opentelemetry::KeyValue;
 
@@ -46,8 +50,8 @@ pub enum Filtered {
 }
 
 /// Coalesces cgroups into shared, labelled telemetry series. Implementations are
-/// pure functions of the cgroup path and hold no per-cgroup state, so one instance
-/// serves every cgroup.
+/// effectively pure functions of the cgroup path (any internal state is
+/// memoization only), so one instance serves every cgroup.
 pub trait CgroupFilter: Send + Sync {
     /// Classify a mount-relative cgroup path (see [`Filtered`]).
     fn apply(&self, path: &str) -> Filtered;
@@ -111,7 +115,7 @@ pub fn parse_filters(names: &[String]) -> Result<Vec<Box<dyn CgroupFilter>>, Str
         .iter()
         .map(|name| -> Result<Box<dyn CgroupFilter>, String> {
             match name.as_str() {
-                "slurm" => Ok(Box::new(SlurmFilter)),
+                "slurm" => Ok(Box::new(SlurmFilter::default())),
                 "user-session" => Ok(Box::new(UserSessionFilter)),
                 other => Err(format!(
                     "unknown cgroup filter {other:?} (known: slurm, user-session)"
@@ -122,8 +126,31 @@ pub fn parse_filters(names: &[String]) -> Result<Vec<Box<dyn CgroupFilter>>, Str
 }
 
 /// Coalesces a SLURM job's `step_*/task_*` sub-cgroups onto the job cgroup and
-/// tags the series with `slurm.job_id` (and `uid` when the layout carries one).
-pub struct SlurmFilter;
+/// tags the series with `slurm.job_id` plus the owning `user.id`/`user.name`.
+///
+/// The owner is read from the `uid_<N>` path segment on the cgroup/v1 layout. The
+/// cgroup/v2 layout carries no uid segment (`system.slice/slurmstepd.scope/job_<N>`,
+/// see <https://slurm.schedmd.com/cgroup_v2.html>), so there we fall back to asking
+/// `squeue` for the job's owner, memoized per job in [`user_cache`](Self::user_cache).
+pub struct SlurmFilter {
+    /// `job_id` -> resolved owner, so the `squeue` fallback runs at most once per
+    /// job instead of once per step/task sub-cgroup that resolves through the
+    /// filter. A `None` value memoizes a failed/absent lookup so a job squeue can't
+    /// answer for isn't re-queried. Bounded (LRU) so a long-lived node's job churn
+    /// can't grow it without limit.
+    user_cache: Mutex<LruCache<u64, Option<SlurmUser>>>,
+}
+
+impl Default for SlurmFilter {
+    fn default() -> Self {
+        // A node runs far fewer than 1024 jobs concurrently, so this only ever
+        // evicts entries for long-finished jobs no longer producing events.
+        let cap = NonZeroUsize::new(1024).expect("nonzero");
+        Self {
+            user_cache: Mutex::new(LruCache::new(cap)),
+        }
+    }
+}
 
 impl CgroupFilter for SlurmFilter {
     fn apply(&self, path: &str) -> Filtered {
@@ -142,15 +169,79 @@ impl CgroupFilter for SlurmFilter {
             .join("/");
 
         let mut attrs = vec![KeyValue::new("slurm.job_id", parsed.job.job_id as i64)];
-        if let Some(uid) = parsed.job.uid {
-            attrs.push(KeyValue::new("user.id", i64::from(uid)));
-            if let Ok(Some(user)) = User::from_uid(Uid::from_raw(uid)) {
-                attrs.push(KeyValue::new("user.name", user.name));
+        // Prefer the uid carried in the path (v1); otherwise ask squeue (v2).
+        let owner = match parsed.job.uid {
+            Some(uid) => Some(SlurmUser {
+                name: User::from_uid(Uid::from_raw(uid))
+                    .ok()
+                    .flatten()
+                    .map(|u| u.name),
+                uid,
+            }),
+            None => self.lookup_owner(parsed.job.job_id),
+        };
+        if let Some(owner) = owner {
+            attrs.push(KeyValue::new("user.id", i64::from(owner.uid)));
+            if let Some(name) = owner.name {
+                attrs.push(KeyValue::new("user.name", name));
             }
         }
 
         Filtered::Coalesce { coalesce_to, attrs }
     }
+}
+
+impl SlurmFilter {
+    /// Resolve a job's owner via `squeue`, memoizing the result (success or not)
+    /// per job in [`user_cache`](Self::user_cache) so the subprocess runs once per
+    /// job rather than once per sub-cgroup.
+    fn lookup_owner(&self, job_id: u64) -> Option<SlurmUser> {
+        let mut cache = self.user_cache.lock().unwrap();
+        if let Some(cached) = cache.get(&job_id) {
+            return cached.clone();
+        }
+        let owner = squeue_owner(job_id);
+        cache.put(job_id, owner.clone());
+        owner
+    }
+}
+
+/// A SLURM job's owning user.
+#[derive(Clone)]
+struct SlurmUser {
+    uid: u32,
+    /// The account name, when it could be resolved (from squeue's `%u`, or the
+    /// passwd database for a uid parsed from the path).
+    name: Option<String>,
+}
+
+/// Ask `squeue` for the owner of `job_id`, for the cgroup/v2 layout whose path
+/// carries no uid segment. Runs `squeue -j <job_id> -h -o "%u %U"`, whose one output
+/// line is `<user_name> <user_id>`. Returns `None` if squeue is absent, errors, or
+/// the job is no longer queued.
+fn squeue_owner(job_id: u64) -> Option<SlurmUser> {
+    let output = Command::new("squeue")
+        .args(["-j", &job_id.to_string(), "-h", "-o", "%u %U"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_squeue_owner(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parse `squeue -h -o "%u %U"` output (`<user_name> <user_id>`) into a
+/// [`SlurmUser`]. Takes the first non-empty line (a job array reports one line per
+/// element, all with the same owner). Returns `None` if no line parses.
+fn parse_squeue_owner(stdout: &str) -> Option<SlurmUser> {
+    let line = stdout.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let mut fields = line.split_whitespace();
+    let name = fields.next()?.to_owned();
+    let uid: u32 = fields.next()?.parse().ok()?;
+    Some(SlurmUser {
+        uid,
+        name: (!name.is_empty()).then_some(name),
+    })
 }
 
 /// Coalesces a user's login sessions and services
@@ -321,13 +412,15 @@ mod tests {
     #[test]
     fn slurm_filter_coalesces_to_job_dir_with_labels() {
         assert_coalesce(
-            SlurmFilter.apply("slurm/uid_38262/job_1349782/step_interactive/task_0"),
+            SlurmFilter::default().apply("slurm/uid_38262/job_1349782/step_interactive/task_0"),
             "slurm/uid_38262/job_1349782",
             &[("slurm.job_id", "1349782"), ("user.id", "38262")],
         );
-        // v2 layout without a uid segment: no uid attribute.
+        // v2 layout without a uid segment: still coalesces to the job dir and tags
+        // the job id. The uid comes from the squeue fallback, absent in the test
+        // environment, so only the job id is asserted here.
         assert_coalesce(
-            SlurmFilter.apply("system.slice/slurmstepd.scope/job_42/step_0/task_0"),
+            SlurmFilter::default().apply("system.slice/slurmstepd.scope/job_42/step_0/task_0"),
             "system.slice/slurmstepd.scope/job_42",
             &[("slurm.job_id", "42")],
         );
@@ -336,11 +429,33 @@ mod tests {
     #[test]
     fn slurm_filter_passes_through_non_slurm() {
         assert!(is_passthrough(
-            &SlurmFilter.apply("system.slice/chronyd.service")
+            &SlurmFilter::default().apply("system.slice/chronyd.service")
         ));
         assert!(is_passthrough(
-            &SlurmFilter.apply("user.slice/user-1000.slice")
+            &SlurmFilter::default().apply("user.slice/user-1000.slice")
         ));
+    }
+
+    #[test]
+    fn parse_squeue_owner_reads_name_and_uid() {
+        // `squeue -h -o "%u %U"` -> "<name> <uid>".
+        let owner = parse_squeue_owner("alice 1001\n").expect("parsed");
+        assert_eq!(owner.uid, 1001);
+        assert_eq!(owner.name.as_deref(), Some("alice"));
+
+        // Job array: one line per element, all the same owner. First line wins.
+        let owner = parse_squeue_owner("bob 2002\nbob 2002\n").expect("parsed");
+        assert_eq!(owner.uid, 2002);
+        assert_eq!(owner.name.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn parse_squeue_owner_rejects_empty_and_malformed() {
+        // No output (job gone), a header-only line, and a non-numeric uid.
+        assert!(parse_squeue_owner("").is_none());
+        assert!(parse_squeue_owner("\n  \n").is_none());
+        assert!(parse_squeue_owner("alice\n").is_none());
+        assert!(parse_squeue_owner("alice notanumber\n").is_none());
     }
 
     #[test]
