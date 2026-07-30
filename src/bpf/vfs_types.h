@@ -95,6 +95,11 @@ enum FsMagic : uint64_t {
     XENIX_SUPER_MAGIC = 0x012ff7b4,
     XFS_SUPER_MAGIC = 0x58465342,
     _XIAFS_SUPER_MAGIC = 0x012fd16d, /* Linux 2.0 and earlier */
+    // not listed in the man page?
+    FUSE_CTL_SUPER_MAGIC = 0x65735543,
+    CONFIGFS_MAGIC = 0x62656570,
+    RPCAUTH_GSSMAGIC = 0x67596969,
+    DMA_BUF_MAGIC = 0x444d4142,
     // third party filesystems
     GPFS_MAGIC = 0x47504653,
     LUSTRE_MAGIC = 0x0BD00BD0,

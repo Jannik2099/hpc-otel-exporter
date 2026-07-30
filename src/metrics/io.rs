@@ -49,6 +49,11 @@ impl FsMagic {
                 | FsMagic::SYSFS_MAGIC
                 | FsMagic::TMPFS_MAGIC
                 | FsMagic::TRACEFS_MAGIC
+                | FsMagic::NSFS_MAGIC
+                | FsMagic::FUSE_CTL_SUPER_MAGIC
+                | FsMagic::CONFIGFS_MAGIC
+                | FsMagic::RPCAUTH_GSSMAGIC
+                | FsMagic::DMA_BUF_MAGIC
         )
     }
 
