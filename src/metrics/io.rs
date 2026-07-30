@@ -66,6 +66,7 @@ impl FsMagic {
             FsMagic::FUSE_SUPER_MAGIC => Some("fuse"),
             FsMagic::GPFS_MAGIC => Some("gpfs"),
             FsMagic::LUSTRE_MAGIC => Some("lustre"),
+            FsMagic::BEEGFS_MAGIC => Some("beegfs"),
             _ => None,
         }
     }
