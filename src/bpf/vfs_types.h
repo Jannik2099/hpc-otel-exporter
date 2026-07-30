@@ -98,6 +98,7 @@ enum FsMagic : uint64_t {
     // third party filesystems
     GPFS_MAGIC = 0x47504653,
     LUSTRE_MAGIC = 0x0BD00BD0,
+    BEEGFS_MAGIC = 0x19830326,
 };
 
 struct TimeInfo {
