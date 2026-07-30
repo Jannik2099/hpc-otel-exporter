@@ -67,6 +67,7 @@ impl FsMagic {
             FsMagic::GPFS_MAGIC => Some("gpfs"),
             FsMagic::LUSTRE_MAGIC => Some("lustre"),
             FsMagic::BEEGFS_MAGIC => Some("beegfs"),
+            FsMagic::MSDOS_SUPER_MAGIC => Some("msdos"),
             _ => None,
         }
     }
