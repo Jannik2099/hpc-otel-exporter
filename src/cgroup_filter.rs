@@ -110,12 +110,17 @@ pub fn apply_filters(
 
 /// Build the ordered filter chain from CLI filter names (the comma-separated
 /// `--cgroup-filters` value). Returns an error naming the first unknown filter.
-pub fn parse_filters(names: &[String]) -> Result<Vec<Box<dyn CgroupFilter>>, String> {
+///
+/// `slurm_use_sudo` is `--slurm-use-sudo`, forwarded to [`SlurmFilter::new`].
+pub fn parse_filters(
+    names: &[String],
+    slurm_use_sudo: bool,
+) -> Result<Vec<Box<dyn CgroupFilter>>, String> {
     names
         .iter()
         .map(|name| -> Result<Box<dyn CgroupFilter>, String> {
             match name.as_str() {
-                "slurm" => Ok(Box::new(SlurmFilter::default())),
+                "slurm" => Ok(Box::new(SlurmFilter::new(slurm_use_sudo))),
                 "user-session" => Ok(Box::new(UserSessionFilter)),
                 other => Err(format!(
                     "unknown cgroup filter {other:?} (known: slurm, user-session)"
@@ -151,15 +156,22 @@ pub struct SlurmFilter {
     /// failed/absent lookup so a job squeue can't answer for isn't re-queried.
     /// Bounded (LRU) so a long-lived node's job churn can't grow it without limit.
     job_cache: Mutex<LruCache<String, Option<SlurmJobInfo>>>,
+    /// Run `squeue` through `sudo` (`--slurm-use-sudo`), for the newer SLURM
+    /// versions that only let a privileged account read other users' jobs.
+    use_sudo: bool,
 }
 
-impl Default for SlurmFilter {
-    fn default() -> Self {
+impl SlurmFilter {
+    /// Build the filter. `use_sudo` is `--slurm-use-sudo`: see
+    /// [`use_sudo`](Self::use_sudo) and the `PR_SET_NO_NEW_PRIVS` note in
+    /// [`crate::sandbox`], which the flag also has to relax.
+    pub fn new(use_sudo: bool) -> Self {
         // A node runs far fewer than 1024 jobs concurrently, so this only ever
         // evicts entries for long-finished jobs no longer producing events.
         let cap = NonZeroUsize::new(1024).expect("nonzero");
         Self {
             job_cache: Mutex::new(LruCache::new(cap)),
+            use_sudo,
         }
     }
 }
@@ -234,7 +246,7 @@ impl SlurmFilter {
         if let Some(cached) = cache.get(query) {
             return cached.clone();
         }
-        let info = squeue_job(query);
+        let info = squeue_job(query, self.use_sudo);
         cache.put(query.to_owned(), info.clone());
         info
     }
@@ -263,8 +275,15 @@ struct SlurmUser {
 /// Runs `squeue -j <query> -h -o "%i %u %U"`, whose one output line
 /// is `<job_id> <user_name> <user_id>`. Returns `None` if squeue is absent,
 /// errors, or the job is no longer queued.
-fn squeue_job(query: &str) -> Option<SlurmJobInfo> {
-    let output = Command::new("squeue")
+fn squeue_job(query: &str, use_sudo: bool) -> Option<SlurmJobInfo> {
+    let mut command = if use_sudo {
+        let mut sudo = Command::new("sudo");
+        sudo.args(["-n", "squeue"]);
+        sudo
+    } else {
+        Command::new("squeue")
+    };
+    let output = command
         .args(["-j", query, "-h", "-o", "%i %u %U"])
         .output()
         .ok()?;
@@ -575,7 +594,7 @@ mod tests {
     #[test]
     fn slurm_filter_coalesces_to_job_dir_with_labels() {
         assert_coalesce(
-            SlurmFilter::default().apply("slurm/uid_38262/job_1349782/step_interactive/task_0"),
+            SlurmFilter::new(false).apply("slurm/uid_38262/job_1349782/step_interactive/task_0"),
             "slurm/uid_38262/job_1349782",
             &[("slurm.job_id", "1349782"), ("user.id", "38262")],
         );
@@ -583,14 +602,14 @@ mod tests {
         // the job id. The uid comes from the squeue fallback, absent in the test
         // environment, so only the job id is asserted here.
         assert_coalesce(
-            SlurmFilter::default().apply("system.slice/slurmstepd.scope/job_42/step_0/task_0"),
+            SlurmFilter::new(false).apply("system.slice/slurmstepd.scope/job_42/step_0/task_0"),
             "system.slice/slurmstepd.scope/job_42",
             &[("slurm.job_id", "42")],
         );
         // SLUID layout: the path names neither job id nor uid, so only the SLUID
         // is asserted — the rest would come from squeue, absent in tests.
         assert_coalesce(
-            SlurmFilter::default()
+            SlurmFilter::new(false)
                 .apply("system.slice/slurmstepd.scope/s5K1KKYAYG5D00/step_0/user"),
             "system.slice/slurmstepd.scope/s5K1KKYAYG5D00",
             &[("slurm.sluid", "s5K1KKYAYG5D00")],
@@ -600,10 +619,10 @@ mod tests {
     #[test]
     fn slurm_filter_passes_through_non_slurm() {
         assert!(is_passthrough(
-            &SlurmFilter::default().apply("system.slice/chronyd.service")
+            &SlurmFilter::new(false).apply("system.slice/chronyd.service")
         ));
         assert!(is_passthrough(
-            &SlurmFilter::default().apply("user.slice/user-1000.slice")
+            &SlurmFilter::new(false).apply("user.slice/user-1000.slice")
         ));
     }
 
@@ -685,7 +704,8 @@ mod tests {
 
     #[test]
     fn chain_applies_filters_in_order() {
-        let filters = parse_filters(&["slurm".to_owned(), "user-session".to_owned()]).unwrap();
+        let filters =
+            parse_filters(&["slurm".to_owned(), "user-session".to_owned()], false).unwrap();
 
         // A system cgroup neither filter handles passes through unchanged.
         let sys = apply_filters(&filters, "system.slice/chronyd.service", false).unwrap();
@@ -715,7 +735,7 @@ mod tests {
 
     #[test]
     fn drop_unhandled_drops_only_uncoalesced_cgroups() {
-        let filters = parse_filters(&["slurm".to_owned()]).unwrap();
+        let filters = parse_filters(&["slurm".to_owned()], false).unwrap();
 
         // A cgroup a filter coalesced is kept regardless of drop_unhandled.
         assert!(apply_filters(&filters, "slurm/uid_1/job_7/step_0", true).is_some());
@@ -728,7 +748,7 @@ mod tests {
 
     #[test]
     fn parse_filters_rejects_unknown() {
-        assert!(parse_filters(&["slurm".to_owned(), "bogus".to_owned()]).is_err());
-        assert!(parse_filters(&[]).unwrap().is_empty());
+        assert!(parse_filters(&["slurm".to_owned(), "bogus".to_owned()], false).is_err());
+        assert!(parse_filters(&[], false).unwrap().is_empty());
     }
 }
