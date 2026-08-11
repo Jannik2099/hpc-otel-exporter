@@ -126,19 +126,31 @@ pub fn parse_filters(names: &[String]) -> Result<Vec<Box<dyn CgroupFilter>>, Str
 }
 
 /// Coalesces a SLURM job's `step_*/task_*` sub-cgroups onto the job cgroup and
-/// tags the series with `slurm.job_id` plus the owning `user.id`/`user.name`.
+/// tags the series with `slurm.job_id` (plus `slurm.sluid` where the path carries
+/// one, and `slurm.job_array_index` for an array element) and the owning
+/// `user.id`/`user.name`.
 ///
-/// The owner is read from the `uid_<N>` path segment on the cgroup/v1 layout. The
-/// cgroup/v2 layout carries no uid segment (`system.slice/slurmstepd.scope/job_<N>`,
-/// see <https://slurm.schedmd.com/cgroup_v2.html>), so there we fall back to asking
-/// `squeue` for the job's owner, memoized per job in [`user_cache`](Self::user_cache).
+/// What the path itself answers depends on the layout:
+/// - cgroup/v1 (`slurm/uid_<U>/job_<J>/...`) names both the job id and the owner,
+///   so nothing else is needed.
+/// - cgroup/v2 before Slurm 26.05 (`system.slice/slurmstepd.scope/job_<J>/...`,
+///   see <https://slurm.schedmd.com/cgroup_v2.html>) names the job id but no
+///   owner.
+/// - cgroup/v2 from Slurm 26.05 on names the job directory by its [SLUID]
+///   (`system.slice/slurmstepd.scope/s5K1KKYAYG5D00/...`) unless the site sets
+///   `CgroupJobIdPaths=yes`, so neither the job id nor the owner is in the path.
+///
+/// Whatever the path leaves out is looked up with `squeue`, which accepts a SLUID
+/// wherever it accepts a job id, memoized per job in [`job_cache`](Self::job_cache).
+///
+/// [SLUID]: https://slurm.schedmd.com/release_notes.html
 pub struct SlurmFilter {
-    /// `job_id` -> resolved owner, so the `squeue` fallback runs at most once per
-    /// job instead of once per step/task sub-cgroup that resolves through the
-    /// filter. A `None` value memoizes a failed/absent lookup so a job squeue can't
-    /// answer for isn't re-queried. Bounded (LRU) so a long-lived node's job churn
-    /// can't grow it without limit.
-    user_cache: Mutex<LruCache<u64, Option<SlurmUser>>>,
+    /// job id or SLUID (as it appears in the path) -> what `squeue` reported, so
+    /// the lookup runs at most once per job instead of once per step/task
+    /// sub-cgroup that resolves through the filter. A `None` value memoizes a
+    /// failed/absent lookup so a job squeue can't answer for isn't re-queried.
+    /// Bounded (LRU) so a long-lived node's job churn can't grow it without limit.
+    job_cache: Mutex<LruCache<String, Option<SlurmJobInfo>>>,
 }
 
 impl Default for SlurmFilter {
@@ -147,7 +159,7 @@ impl Default for SlurmFilter {
         // evicts entries for long-finished jobs no longer producing events.
         let cap = NonZeroUsize::new(1024).expect("nonzero");
         Self {
-            user_cache: Mutex::new(LruCache::new(cap)),
+            job_cache: Mutex::new(LruCache::new(cap)),
         }
     }
 }
@@ -168,17 +180,38 @@ impl CgroupFilter for SlurmFilter {
             .collect::<Vec<_>>()
             .join("/");
 
-        let mut attrs = vec![KeyValue::new("slurm.job_id", parsed.job.job_id as i64)];
-        // Prefer the uid carried in the path (v1); otherwise ask squeue (v2).
+        let mut attrs = Vec::new();
+        // What squeue would be asked about, and what the path already answers: a
+        // `job_<N>` directory names the job id outright, a SLUID one doesn't.
+        let (query, path_job_id) = match &parsed.job.key {
+            SlurmJobKey::JobId(id) => (id.to_string(), Some(*id)),
+            SlurmJobKey::Sluid(sluid) => {
+                attrs.push(KeyValue::new("slurm.sluid", sluid.clone()));
+                (sluid.clone(), None)
+            }
+        };
+
+        // Only shell out when the path leaves something open: the job id (SLUID
+        // layouts) or the owner (every layout without a `uid_<N>` segment).
+        let queried = (path_job_id.is_none() || parsed.job.uid.is_none())
+            .then(|| self.lookup(&query))
+            .flatten();
+
+        if let Some(job_id) = path_job_id.or_else(|| queried.as_ref()?.job_id) {
+            attrs.push(KeyValue::new("slurm.job_id", job_id as i64));
+        }
+        // Only squeue knows the array index; a `job_<N>` path with a `uid_<N>`
+        // segment answers everything else and so is never queried.
+        if let Some(index) = queried.as_ref().and_then(|info| info.array_index) {
+            attrs.push(KeyValue::new("slurm.job_array_index", index as i64));
+        }
+        // Prefer the uid carried in the path; otherwise take squeue's.
         let owner = match parsed.job.uid {
             Some(uid) => Some(SlurmUser {
-                name: User::from_uid(Uid::from_raw(uid))
-                    .ok()
-                    .flatten()
-                    .map(|u| u.name),
                 uid,
+                name: passwd_name(uid),
             }),
-            None => self.lookup_owner(parsed.job.job_id),
+            None => queried.map(|info| info.user),
         };
         if let Some(owner) = owner {
             attrs.push(KeyValue::new("user.id", i64::from(owner.uid)));
@@ -192,18 +225,29 @@ impl CgroupFilter for SlurmFilter {
 }
 
 impl SlurmFilter {
-    /// Resolve a job's owner via `squeue`, memoizing the result (success or not)
-    /// per job in [`user_cache`](Self::user_cache) so the subprocess runs once per
-    /// job rather than once per sub-cgroup.
-    fn lookup_owner(&self, job_id: u64) -> Option<SlurmUser> {
-        let mut cache = self.user_cache.lock().unwrap();
-        if let Some(cached) = cache.get(&job_id) {
+    /// Resolve a job via `squeue`, memoizing the result (success or not) per job
+    /// in [`job_cache`](Self::job_cache) so the subprocess runs once per job
+    /// rather than once per sub-cgroup. `query` is the job id or SLUID exactly as
+    /// the cgroup path spelled it.
+    fn lookup(&self, query: &str) -> Option<SlurmJobInfo> {
+        let mut cache = self.job_cache.lock().unwrap();
+        if let Some(cached) = cache.get(query) {
             return cached.clone();
         }
-        let owner = squeue_owner(job_id);
-        cache.put(job_id, owner.clone());
-        owner
+        let info = squeue_job(query);
+        cache.put(query.to_owned(), info.clone());
+        info
     }
+}
+
+/// What `squeue` reports about a job the cgroup path didn't fully identify.
+#[derive(Clone)]
+struct SlurmJobInfo {
+    /// The numeric job id from `%i`, absent when that field didn't parse.
+    job_id: Option<u64>,
+    /// The array index from `%i`, for a job array element only.
+    array_index: Option<u64>,
+    user: SlurmUser,
 }
 
 /// A SLURM job's owning user.
@@ -215,33 +259,71 @@ struct SlurmUser {
     name: Option<String>,
 }
 
-/// Ask `squeue` for the owner of `job_id`, for the cgroup/v2 layout whose path
-/// carries no uid segment. Runs `squeue -j <job_id> -h -o "%u %U"`, whose one output
-/// line is `<user_name> <user_id>`. Returns `None` if squeue is absent, errors, or
-/// the job is no longer queued.
-fn squeue_owner(job_id: u64) -> Option<SlurmUser> {
+/// Ask `squeue` about a job, given either its numeric id or its SLUID.
+/// Runs `squeue -j <query> -h -o "%i %u %U"`, whose one output line
+/// is `<job_id> <user_name> <user_id>`. Returns `None` if squeue is absent,
+/// errors, or the job is no longer queued.
+fn squeue_job(query: &str) -> Option<SlurmJobInfo> {
     let output = Command::new("squeue")
-        .args(["-j", &job_id.to_string(), "-h", "-o", "%u %U"])
+        .args(["-j", query, "-h", "-o", "%i %u %U"])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    parse_squeue_owner(&String::from_utf8_lossy(&output.stdout))
+    parse_squeue_job(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// Parse `squeue -h -o "%u %U"` output (`<user_name> <user_id>`) into a
-/// [`SlurmUser`]. Takes the first non-empty line (a job array reports one line per
-/// element, all with the same owner). Returns `None` if no line parses.
-fn parse_squeue_owner(stdout: &str) -> Option<SlurmUser> {
+/// Parse `squeue -h -o "%i %u %U"` output (`<job_id> <user_name> <user_id>`) into
+/// a [`SlurmJobInfo`]. Takes the first non-empty line for a query that resolves
+/// to several (a job array queried by its base id), which is the one whose
+/// identity we report. Returns `None` if no line parses; a `%i` that isn't a job
+/// id only clears [`job_id`](SlurmJobInfo::job_id).
+fn parse_squeue_job(stdout: &str) -> Option<SlurmJobInfo> {
     let line = stdout.lines().map(str::trim).find(|l| !l.is_empty())?;
     let mut fields = line.split_whitespace();
+    let (job_id, array_index) = parse_squeue_job_id(fields.next()?);
     let name = fields.next()?.to_owned();
     let uid: u32 = fields.next()?.parse().ok()?;
-    Some(SlurmUser {
-        uid,
-        name: (!name.is_empty()).then_some(name),
+    Some(SlurmJobInfo {
+        job_id,
+        array_index,
+        user: SlurmUser {
+            uid,
+            name: (!name.is_empty()).then_some(name),
+        },
     })
+}
+
+/// Split a squeue `%i` value into its numeric job id and, for a job array
+/// element, its array index.
+///
+/// A plain job is all digits. A job array element reads `<base_job_id>_<index>`,
+/// whose id is the base. The element is told apart by the index, and by its own
+/// cgroup and `slurm.sluid`. A heterogeneous component reads `<leader>+<offset>`,
+/// which yields the leader's id and no index.
+///
+/// A *pending* array reports a whole bitstring instead of one element
+/// (`12345_[1-10]`), which is no single index and so parses to `None`. The
+/// cgroups resolved here belong to running elements, which always report a plain
+/// number.
+fn parse_squeue_job_id(field: &str) -> (Option<u64>, Option<u64>) {
+    match field.split_once('_') {
+        Some((base, index)) => (base.parse().ok(), index.parse().ok()),
+        // Not an array: keep a heterogeneous component's leader id.
+        None => (
+            field.split_once('+').map_or(field, |(l, _)| l).parse().ok(),
+            None,
+        ),
+    }
+}
+
+/// The account name for `uid` from the passwd database, when it resolves.
+fn passwd_name(uid: u32) -> Option<String> {
+    User::from_uid(Uid::from_raw(uid))
+        .ok()
+        .flatten()
+        .map(|u| u.name)
 }
 
 /// Coalesces a user's login sessions and services
@@ -286,11 +368,22 @@ fn user_slice_uid(component: &str) -> Option<u32> {
         })
 }
 
+/// How the job cgroup directory names its job.
+enum SlurmJobKey {
+    /// A numeric job id, from a `job_<N>` component: the cgroup/v1 layout, and
+    /// cgroup/v2 either before Slurm 26.05 or with `CgroupJobIdPaths=yes`.
+    JobId(u64),
+    /// A SLUID (Slurm Lexicographically-sortable Unique ID), which cgroup/v2
+    /// names job directories with from Slurm 26.05 on. It carries no job id, so
+    /// one has to come from `squeue`.
+    Sluid(String),
+}
+
 /// The SLURM identity parsed from a job cgroup path.
 struct SlurmJob {
-    job_id: u64,
+    key: SlurmJobKey,
     /// The owning user, from the `uid_<N>` path segment when present (v1 layout);
-    /// `None` when the layout carries no uid segment (some v2 layouts).
+    /// `None` when the layout carries no uid segment (the v2 layouts).
     uid: Option<u32>,
 }
 
@@ -305,9 +398,10 @@ struct SlurmParse {
 
 /// Detect a SLURM job in a mount-relative cgroup path and find the job cgroup to
 /// aggregate it into. Generic across the v1 layout (`slurm/uid_<U>/job_<J>/step_*/
-/// task_*`) and v2 layouts (which may differ and may omit the `uid_` segment): we
-/// key purely off the first `job_<digits>` component, and pick up an `uid_<digits>`
-/// component preceding it when present. Returns `None` for non-SLURM cgroups.
+/// task_*`) and the v2 layouts (which may differ and omit the `uid_` segment): we
+/// key purely off the first component that names a job: `job_<digits>` or a bare
+/// SLUID, see [`slurm_job_key`], and pick up an `uid_<digits>` component
+/// preceding it when present. Returns `None` for non-SLURM cgroups.
 fn parse_slurm(rel: &Path) -> Option<SlurmParse> {
     let comps: Vec<&str> = rel
         .iter()
@@ -315,10 +409,10 @@ fn parse_slurm(rel: &Path) -> Option<SlurmParse> {
         .filter(|c| !c.is_empty())
         .collect();
 
-    let job_idx = comps
+    let (job_idx, key) = comps
         .iter()
-        .position(|c| parse_prefixed_u64(c, "job_").is_some())?;
-    let job_id = parse_prefixed_u64(comps[job_idx], "job_")?;
+        .enumerate()
+        .find_map(|(i, c)| slurm_job_key(c).map(|key| (i, key)))?;
 
     // The owning uid, from a `uid_<N>` segment before the job component (v1).
     let uid = comps[..job_idx]
@@ -328,9 +422,30 @@ fn parse_slurm(rel: &Path) -> Option<SlurmParse> {
         .and_then(|u| u32::try_from(u).ok());
 
     Some(SlurmParse {
-        job: SlurmJob { job_id, uid },
+        job: SlurmJob { key, uid },
         depth: job_idx + 1,
     })
+}
+
+/// Recognize the path component naming a SLURM job cgroup directory: `job_<N>`,
+/// or a bare SLUID on the cgroup/v2 layout from Slurm 26.05 on. `None` for any
+/// other component.
+fn slurm_job_key(component: &str) -> Option<SlurmJobKey> {
+    if let Some(job_id) = parse_prefixed_u64(component, "job_") {
+        return Some(SlurmJobKey::JobId(job_id));
+    }
+    is_sluid(component).then(|| SlurmJobKey::Sluid(component.to_owned()))
+}
+
+/// Whether a component is a SLUID exactly as Slurm's `print_sluid` writes it:
+/// a lowercase `s` followed by Crockford base32 digits
+/// (`0`-`9` and `A`-`Z` minus the ambiguous `I`, `L`, `O`, `U`).
+fn is_sluid(component: &str) -> bool {
+    const CB32: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let Some(digits) = component.strip_prefix('s') else {
+        return false;
+    };
+    digits.bytes().all(|b| CB32.contains(&b))
 }
 
 /// Parse `<prefix><digits>` (e.g. `job_1349782`) into the trailing number, or
@@ -374,6 +489,22 @@ mod tests {
         matches!(filtered, Filtered::PassThrough)
     }
 
+    /// The numeric job id a parse recognized, or `None` for a SLUID (which names
+    /// no job id) — so tests can assert on the identity without matching.
+    fn parsed_job_id(parsed: &SlurmParse) -> Option<u64> {
+        match parsed.job.key {
+            SlurmJobKey::JobId(id) => Some(id),
+            SlurmJobKey::Sluid(_) => None,
+        }
+    }
+
+    fn parsed_sluid(parsed: &SlurmParse) -> Option<&str> {
+        match &parsed.job.key {
+            SlurmJobKey::Sluid(s) => Some(s),
+            SlurmJobKey::JobId(_) => None,
+        }
+    }
+
     #[test]
     fn parse_slurm_v1_layout() {
         // v1: /slurm/uid_<U>/job_<J>/step_<S>/task_<T>.
@@ -381,7 +512,7 @@ mod tests {
             "slurm/uid_38262/job_1349782/step_interactive/task_0",
         ))
         .expect("recognized as a SLURM job");
-        assert_eq!(parsed.job.job_id, 1349782);
+        assert_eq!(parsed_job_id(&parsed), Some(1349782));
         assert_eq!(parsed.job.uid, Some(38262));
         // Canonical job dir = slurm/uid_38262/job_1349782 (3 components).
         assert_eq!(parsed.depth, 3);
@@ -395,9 +526,38 @@ mod tests {
             "system.slice/slurmstepd.scope/job_42/step_0/user/task_special",
         ))
         .expect("recognized as a SLURM job");
-        assert_eq!(parsed.job.job_id, 42);
+        assert_eq!(parsed_job_id(&parsed), Some(42));
         assert_eq!(parsed.job.uid, None);
         assert_eq!(parsed.depth, 3); // system.slice/slurmstepd.scope/job_42
+    }
+
+    #[test]
+    fn parse_slurm_v2_sluid_layout() {
+        // Slurm >= 26.05 cgroup/v2: the job dir is the bare SLUID, no `job_`
+        // prefix and no job id anywhere in the path.
+        let parsed = parse_slurm(Path::new(
+            "system.slice/slurmstepd.scope/s5K1KKYAYG5D00/step_0/user",
+        ))
+        .expect("recognized as a SLURM job");
+        assert_eq!(parsed_sluid(&parsed), Some("s5K1KKYAYG5D00"));
+        assert_eq!(parsed.job.uid, None);
+        assert_eq!(parsed.depth, 3); // system.slice/slurmstepd.scope/s5K1KKYAYG5D00
+    }
+
+    #[test]
+    fn is_sluid_accepts_only_the_printed_form() {
+        assert!(is_sluid("s5K1KKYAYG5D00"));
+        assert!(is_sluid("s0000000000000"));
+        // missing/uppercase prefix.
+        assert!(!is_sluid("5K1KKYAYG5D00"));
+        assert!(!is_sluid("S5K1KKYAYG5D00"));
+        // Not Crockford base32: the ambiguous I/L/O/U, and lowercase digits.
+        assert!(!is_sluid("s5K1KKYAYG5DI0"));
+        assert!(!is_sluid("s5K1KKYAYG5DU0"));
+        assert!(!is_sluid("s5k1kkyayg5d00"));
+        // Real cgroup names of the same rough shape stay unclaimed.
+        assert!(!is_sluid("session-3.scope"));
+        assert!(!is_sluid("slurmstepd.scope"));
     }
 
     #[test]
@@ -407,6 +567,9 @@ mod tests {
         // `job_` with no digits, or non-numeric, is not a job component.
         assert!(parse_slurm(Path::new("slurm/job_/step_0")).is_none());
         assert!(parse_slurm(Path::new("slurm/job_abc")).is_none());
+        // A component that merely starts with `s` is not a SLUID.
+        assert!(parse_slurm(Path::new("system.slice/sshd.service")).is_none());
+        assert!(parse_slurm(Path::new("machine.slice/scope_abcdefgh")).is_none());
     }
 
     #[test]
@@ -424,6 +587,14 @@ mod tests {
             "system.slice/slurmstepd.scope/job_42",
             &[("slurm.job_id", "42")],
         );
+        // SLUID layout: the path names neither job id nor uid, so only the SLUID
+        // is asserted — the rest would come from squeue, absent in tests.
+        assert_coalesce(
+            SlurmFilter::default()
+                .apply("system.slice/slurmstepd.scope/s5K1KKYAYG5D00/step_0/user"),
+            "system.slice/slurmstepd.scope/s5K1KKYAYG5D00",
+            &[("slurm.sluid", "s5K1KKYAYG5D00")],
+        );
     }
 
     #[test]
@@ -437,25 +608,45 @@ mod tests {
     }
 
     #[test]
-    fn parse_squeue_owner_reads_name_and_uid() {
-        // `squeue -h -o "%u %U"` -> "<name> <uid>".
-        let owner = parse_squeue_owner("alice 1001\n").expect("parsed");
-        assert_eq!(owner.uid, 1001);
-        assert_eq!(owner.name.as_deref(), Some("alice"));
+    fn parse_squeue_job_reads_job_id_name_and_uid() {
+        // `squeue -h -o "%i %u %U"` -> "<job id> <name> <uid>".
+        let info = parse_squeue_job("1349782 alice 1001\n").expect("parsed");
+        assert_eq!(info.job_id, Some(1349782));
+        assert_eq!(info.user.uid, 1001);
+        assert_eq!(info.user.name.as_deref(), Some("alice"));
 
-        // Job array: one line per element, all the same owner. First line wins.
-        let owner = parse_squeue_owner("bob 2002\nbob 2002\n").expect("parsed");
-        assert_eq!(owner.uid, 2002);
-        assert_eq!(owner.name.as_deref(), Some("bob"));
+        assert_eq!(info.array_index, None);
+
+        // Job array element: `%i`'s `<base>_<index>` splits into both.
+        let info = parse_squeue_job("12345_3 bob 2002\n").expect("parsed");
+        assert_eq!(info.job_id, Some(12345));
+        assert_eq!(info.array_index, Some(3));
+        assert_eq!(info.user.uid, 2002);
+        assert_eq!(info.user.name.as_deref(), Some("bob"));
+
+        // Heterogeneous job component: `<leader>+<offset>` yields the leader and
+        // no array index.
+        let info = parse_squeue_job("777+1 carol 3003\n").expect("parsed");
+        assert_eq!(info.job_id, Some(777));
+        assert_eq!(info.array_index, None);
+
+        // A pending array's bitstring is no single element: base id, no index.
+        let info = parse_squeue_job("12345_[1-10] bob 2002\n").expect("parsed");
+        assert_eq!(info.job_id, Some(12345));
+        assert_eq!(info.array_index, None);
     }
 
     #[test]
-    fn parse_squeue_owner_rejects_empty_and_malformed() {
-        // No output (job gone), a header-only line, and a non-numeric uid.
-        assert!(parse_squeue_owner("").is_none());
-        assert!(parse_squeue_owner("\n  \n").is_none());
-        assert!(parse_squeue_owner("alice\n").is_none());
-        assert!(parse_squeue_owner("alice notanumber\n").is_none());
+    fn parse_squeue_job_rejects_empty_and_malformed() {
+        // No output (job gone), a blank-only body, and a missing/non-numeric uid.
+        assert!(parse_squeue_job("").is_none());
+        assert!(parse_squeue_job("\n  \n").is_none());
+        assert!(parse_squeue_job("1349782 alice\n").is_none());
+        assert!(parse_squeue_job("1349782 alice notanumber\n").is_none());
+        // An unparseable `%i` only clears the job id; the owner still lands.
+        let info = parse_squeue_job("weird alice 1001\n").expect("parsed");
+        assert_eq!(info.job_id, None);
+        assert_eq!(info.user.uid, 1001);
     }
 
     #[test]
