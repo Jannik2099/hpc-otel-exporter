@@ -53,7 +53,7 @@ gimli = { version = "0.33", default-features = false, features = [
     "read",
     "std",
 ] }
-object = { version = "0.39", default-features = false, features = [
+object = { version = "0.40", default-features = false, features = [
     "read",
     "std",
 ] }
