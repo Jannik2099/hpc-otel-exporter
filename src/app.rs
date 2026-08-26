@@ -121,6 +121,24 @@ pub struct Args {
     /// filter-claimed cgroups (a whitelist). With no filters this drops everything.
     #[arg(long)]
     drop_unhandled: bool,
+
+    /// User to drop privileges to once the eBPF programs are attached: a name or
+    /// a numeric uid.
+    #[arg(long, default_value = crate::sandbox::DEFAULT_SANDBOX_USER)]
+    sandbox_user: String,
+
+    /// Group to drop privileges to: a name or a numeric gid.
+    /// Defaults to `--sandbox-user`'s primary group.
+    #[arg(long)]
+    sandbox_group: Option<String>,
+
+    /// Run the `slurm` cgroup filter's `squeue` lookups through `sudo -n`, for
+    /// sites where only a privileged account may introspect other users' jobs.
+    /// The sudoers rule has to name `--sandbox-user`, which is who the exporter
+    /// runs as by then. Also leaves `PR_SET_NO_NEW_PRIVS` unset, since it would
+    /// otherwise stop setuid `sudo` from raising privileges.
+    #[arg(long)]
+    slurm_use_sudo: bool,
 }
 
 /// Which cgroup hierarchy to track, selected via `--cgroups-mode`. `Auto` (the
@@ -173,7 +191,7 @@ async fn run_async(args: Args) -> Result<()> {
 
     // Validate & build the coalescing filters up front,
     // so a bad `--cgroup-filters` value fails fast with a clear error.
-    let filters = crate::cgroup_filter::parse_filters(&args.cgroup_filters)
+    let filters = crate::cgroup_filter::parse_filters(&args.cgroup_filters, args.slurm_use_sudo)
         .map_err(|e| anyhow::anyhow!(e))?;
 
     // Which signals to collect. With none given on the CLI, enable all of
@@ -284,13 +302,15 @@ async fn run_async(args: Args) -> Result<()> {
     }
     info!("eBPF programs attached!");
 
-    // Profiling needs to read /proc/pid/maps
-    // TODO: externalize to a separate process?
-    if enabled.contains(&Signal::CpuProfiles) {
-        crate::sandbox::init_sandbox(false)?;
-    } else {
-        crate::sandbox::init_sandbox(true)?;
-    }
+    crate::sandbox::init_sandbox(&crate::sandbox::SandboxConfig {
+        // Profiling needs to read /proc/pid/maps
+        // TODO: externalize to a separate process?
+        drop_privs: !enabled.contains(&Signal::CpuProfiles),
+        user: &args.sandbox_user,
+        group: args.sandbox_group.as_deref(),
+        // `sudo` is setuid, which PR_SET_NO_NEW_PRIVS would neuter.
+        no_new_privs: !args.slurm_use_sudo,
+    })?;
 
     // Shared with the cleanup task below; shutdown still walks them at the end.
     let collectors: Arc<[Box<dyn Collector>]> = Arc::from(collectors);
