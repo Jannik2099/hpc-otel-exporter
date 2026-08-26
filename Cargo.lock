@@ -989,7 +989,7 @@ dependencies = [
  "lru",
  "memmap2",
  "nix",
- "object 0.39.1",
+ "object 0.40.0",
  "opentelemetry",
  "opentelemetry-appender-log",
  "opentelemetry-otlp",
@@ -1705,6 +1705,15 @@ dependencies = [
  "flate2",
  "memchr",
  "ruzstd",
+]
+
+[[package]]
+name = "object"
+version = "0.40.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd229a0361b9d0d4396176e02d65897f487eebeab7caa6d443855ee152ca0b9c"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
